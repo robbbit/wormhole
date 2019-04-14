@@ -43,6 +43,7 @@ import Table from 'antd/lib/table'
 import Card from 'antd/lib/card'
 import Checkbox from 'antd/lib/checkbox'
 import Radio from 'antd/lib/radio'
+import Select from 'antd/lib/select'
 const RadioGroup = Radio.Group
 const RadioButton = Radio.Button
 import DatePicker from 'antd/lib/date-picker'
@@ -65,7 +66,8 @@ export class WorkbenchJobForm extends React.Component {
       sinkNsData: [],
       backfillSinkDSValue: '',
       namespaceId: '',
-      backfillTopicValue: ''
+      backfillTopicValue: '',
+      sinkNamespaceResult: []
     }
   }
   componentWillReceiveProps (props) {
@@ -124,7 +126,6 @@ export class WorkbenchJobForm extends React.Component {
       }
     }
   }
-
   // 通过 Sink Data System 显示 Sink Namespace 内容
   onSinkDataSystemItemSelect = (val) => {
     const { projectIdGeted, jobMode, locale } = this.props
@@ -134,6 +135,7 @@ export class WorkbenchJobForm extends React.Component {
 
       this.props.onLoadJobSinkNs(projectIdGeted, val, 'sinkType', (result) => {
         this.setState({
+          sinkNamespaceResult: result,
           sinkNsData: generateSourceSinkNamespaceHierarchy(val, result)
         })
         if (jobMode === 'add') {
@@ -147,7 +149,17 @@ export class WorkbenchJobForm extends React.Component {
       sinkConfigClass: val === 'hbase' ? 'sink-config-class' : ''
     })
   }
-
+  namespaceChange = (value, selectedOptions) => {
+    let id = selectedOptions[2].id
+    let sinkNamespaceResult = this.state.sinkNamespaceResult
+    sinkNamespaceResult.forEach(v => {
+      if (v.id === id) {
+        this.props.form.setFieldsValue({tableKeys: v.keys})
+      }
+    })
+    console.log('value:', value)
+    console.log('selectedOptions:', selectedOptions)
+  }
   changeJobType = (e) => {
     this.props.onInitJobTypeSelect(e.target.value)
     this.props.clearSinkData()
@@ -162,7 +174,8 @@ export class WorkbenchJobForm extends React.Component {
     const { jobDiffType, step, form, jobMode, fieldSelected, jobTranTableConfirmValue, onShowJobTransModal,
       onShowJobSinkConfigModal, jobTransTableSource, onDeleteSingleTransform, onJobAddTransform,
       onEditTransform, onUpTransform, onDownTransform, jobStepSourceNs, jobStepSinkNs, jobSourceNsSys,
-      jobTranTagClassName, jobTranTableClassName, jobTranConfigConfirmValue, locale, initialBackfillCascader, backfillSinkNsValue
+      jobTranTagClassName, jobTranTableClassName, jobTranConfigConfirmValue, locale, initialBackfillCascader, backfillSinkNsValue,
+      initialSourceNsVersion
     } = this.props
     const { getFieldDecorator } = form
     const { sinkConfigClass, sourceNsData, sinkNsData, backfillSinkDSValue, backfillTopicValue } = this.state
@@ -494,6 +507,20 @@ export class WorkbenchJobForm extends React.Component {
               </FormItem>
             </Col>
             <Col span={24}>
+              <FormItem label="Version" {...itemStyle}>
+                {getFieldDecorator('sourceNamespaceVersion', {
+                  rules: [{
+                    required: true,
+                    message: operateLanguageSelect('version', 'Version')
+                  }]
+                })(
+                  <Select style={{ width: 120 }} allowClear onFocus={initialSourceNsVersion}>
+                    {this.props.sourceNsVersionList.map((v, i) => (<Select.Option value={v} key={i}>{v}</Select.Option>))}
+                  </Select>
+                )}
+              </FormItem>
+            </Col>
+            <Col span={24}>
               <FormItem label="Protocol" {...itemStyle}>
                 {getFieldDecorator('protocol', {
                   rules: [{
@@ -545,11 +572,18 @@ export class WorkbenchJobForm extends React.Component {
                     options={sinkNsData}
                     expandTrigger="hover"
                     displayRender={(labels) => labels.join('.')}
+                    onChange={this.namespaceChange}
                   />
                 )}
               </FormItem>
             </Col>
-
+            <Col span={24}>
+              <FormItem label="Table keys" {...itemStyle}>
+                {getFieldDecorator('tableKeys')(
+                  <Input />
+                )}
+              </FormItem>
+            </Col>
             <Col span={24} className={`result-field-class ${jobDiffType === 'default' ? '' : 'hide'}`}>
               <FormItem label="Result Fields" {...itemStyle}>
                 {getFieldDecorator('resultFields', {
@@ -828,7 +862,8 @@ WorkbenchJobForm.propTypes = {
   backfillSinkNsValue: PropTypes.string,
   clearSinkData: PropTypes.func,
   jobSourceNsSys: PropTypes.string,
-
+  sourceNsVersionList: PropTypes.array,
+  initialSourceNsVersion: PropTypes.func,
   onLoadJobName: PropTypes.func,
   locale: PropTypes.string
 }

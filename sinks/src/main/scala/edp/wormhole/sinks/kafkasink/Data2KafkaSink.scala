@@ -36,28 +36,39 @@ import org.apache.log4j.Logger
 
 class Data2KafkaSink extends SinkProcessor {
   private lazy val logger = Logger.getLogger(this.getClass)
-  override def process(protocolType: UmsProtocolType,
-                       sourceNamespace: String,
+
+  override def process(sourceNamespace: String,
                        sinkNamespace: String,
                        sinkProcessConfig: SinkProcessConfig,
                        schemaMap: collection.Map[String, (Int, UmsFieldType, Boolean)],
                        tupleList: Seq[Seq[String]],
                        connectionConfig: ConnectionConfig): Unit = {
-    logger.info("In Data2KafkaSink"+tupleList)
-    WormholeKafkaProducer.init(connectionConfig.connectionUrl, connectionConfig.parameters)
-    val sinkSpecificConfig = if (sinkProcessConfig.specialConfig.isDefined) JsonUtils.json2caseClass[KafkaConfig](sinkProcessConfig.specialConfig.get) else KafkaConfig(None, None, None,None)
+    if(tupleList.nonEmpty) {
+      logger.info("In Data2KafkaSink" + tupleList.head)
+    }
+    logger.info("Data2KafkaSink sink config: " + sinkProcessConfig)
+    val sinkSpecificConfig = if (sinkProcessConfig.specialConfig.isDefined) JsonUtils.json2caseClass[KafkaConfig](sinkProcessConfig.specialConfig.get) else KafkaConfig(None, None, None, None, None)
+    WormholeKafkaProducer.init(connectionConfig.connectionUrl, connectionConfig.parameters, sinkSpecificConfig.kerberos.getOrElse(false))
 
     val schemaList: Seq[(String, (Int, UmsFieldType, Boolean))] = schemaMap.toSeq.sortBy(_._2._1)
-    val protocol: UmsProtocol = UmsProtocol(protocolType)
+    val protocol: UmsProtocol =
+      if (sinkSpecificConfig.topic.nonEmpty && sinkSpecificConfig.topic.get.nonEmpty)
+        UmsProtocol(UmsProtocolType.DATA_BATCH_DATA)
+      else
+        UmsProtocol(UmsProtocolType.DATA_INCREMENT_DATA)
+
     //for job of feedback
-    val kafkaTopic = if(sinkSpecificConfig.sinkKafkaTopic.nonEmpty&&sinkSpecificConfig.sinkKafkaTopic.get.nonEmpty) sinkSpecificConfig.sinkKafkaTopic.get else sinkNamespace.split("\\.")(2)
+    val kafkaTopic = if (sinkSpecificConfig.topic.nonEmpty && sinkSpecificConfig.topic.get.nonEmpty) sinkSpecificConfig.topic.get else sinkNamespace.split("\\.")(2)
+    logger.info("sink topic: " + kafkaTopic)
+    logger.info("sink protocol: " + protocol.`type`.toString)
+
     val format = sinkSpecificConfig.messageFormat.trim
     format match {
       case "ums" =>
         val seqUmsField: Seq[UmsField] = schemaList.map(kv => UmsField(kv._1, kv._2._2, Some(kv._2._3)))
         val schema = UmsSchema(sinkNamespace, Some(seqUmsField))
         val kafkaLimitNum = sinkSpecificConfig.limitNum
-        ums2Kafka(tupleList, kafkaLimitNum, protocol, schema, protocolType, sinkNamespace, kafkaTopic, connectionConfig)
+        ums2Kafka(tupleList, kafkaLimitNum, protocol, schema, protocol.`type`, sinkNamespace, kafkaTopic, connectionConfig)
       case "flattenJson" =>
         val hasSystemField = sinkSpecificConfig.hasSystemField
         if (hasSystemField) flattenJson2KafkaWithSystemValue(tupleList, schemaList, sinkNamespace, kafkaTopic, connectionConfig, protocol.`type`.toString)
@@ -74,12 +85,15 @@ class Data2KafkaSink extends SinkProcessor {
       val flattenJson = new JSONObject
       var index = 0
       tuple.foreach(t => {
-        flattenJson.put(schemaList(index)._1, UmsFieldType.umsFieldValue(t, schemaList(index)._2._2))
+        val umsFieldType = schemaList(index)._2._2
+        if (umsFieldType == DATETIME || umsFieldType == DATE)
+          flattenJson.put(schemaList(index)._1, t)
+        else flattenJson.put(schemaList(index)._1, UmsFieldType.umsFieldValue(t, schemaList(index)._2._2))
         index += 1
       })
       flattenJson.put("namespace", sinkNamespace)
       flattenJson.put("protocol", protocol)
-      WormholeKafkaProducer.sendMessage(kafkaTopic, flattenJson.toJSONString, Some(protocol + "." + sinkNamespace+"..."+UUID.randomUUID().toString), connectionConfig.connectionUrl)
+      WormholeKafkaProducer.sendMessage(kafkaTopic, flattenJson.toJSONString, Some(protocol + "." + sinkNamespace + "..." + UUID.randomUUID().toString), connectionConfig.connectionUrl)
     }
     )
   }
@@ -91,24 +105,28 @@ class Data2KafkaSink extends SinkProcessor {
       var index = 0
       tuple.foreach(t => {
         if (!schemaList(index)._1.startsWith("ums_")) {
-          flattenJson.put(schemaList(index)._1, UmsFieldType.umsFieldValue(t, schemaList(index)._2._2))
+          val umsFieldType = schemaList(index)._2._2
+          if (umsFieldType == DATETIME || umsFieldType == DATE)
+            flattenJson.put(schemaList(index)._1, t)
+          else flattenJson.put(schemaList(index)._1, UmsFieldType.umsFieldValue(t, schemaList(index)._2._2))
         }
         index += 1
       })
-      WormholeKafkaProducer.sendMessage(kafkaTopic, flattenJson.toJSONString, Some(protocol + "." + sinkNamespace+"..."+UUID.randomUUID().toString), connectionConfig.connectionUrl)
+      WormholeKafkaProducer.sendMessage(kafkaTopic, flattenJson.toJSONString, Some(protocol + "." + sinkNamespace + "..." + UUID.randomUUID().toString), connectionConfig.connectionUrl)
     }
     )
   }
 
 
   private def ums2Kafka(tupleList: Seq[Seq[String]], kafkaLimitNum: Int, protocol: UmsProtocol, schema: UmsSchema, protocolType: UmsProtocolType, sinkNamespace: String, kafkaTopic: String, connectionConfig: ConnectionConfig): Unit = {
+    logger.info("start write to kafka")
     tupleList.sliding(kafkaLimitNum, kafkaLimitNum).foreach(tuple => {
       val seqUmsTuple: Seq[UmsTuple] = tuple.map(payload => UmsTuple(payload))
       val kafkaMessage: String = toJsonCompact(Ums(
         protocol,
         schema,
         payload = Some(seqUmsTuple)))
-      WormholeKafkaProducer.sendMessage(kafkaTopic, kafkaMessage, Some(protocolType + "." + sinkNamespace+"..."+UUID.randomUUID().toString), connectionConfig.connectionUrl)
+      WormholeKafkaProducer.sendMessage(kafkaTopic, kafkaMessage, Some(protocolType + "." + sinkNamespace + "..." + UUID.randomUUID().toString), connectionConfig.connectionUrl)
     })
   }
 }

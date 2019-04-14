@@ -39,13 +39,13 @@ class FlowUdfDal(udfTable: TableQuery[UdfTable], relProjectUdfDal: RelProjectUdf
 
   def getFlowUdf(flowIds: Seq[Long], udfIdsOpt: Option[Seq[Long]] = None): Seq[FlowUdfResponse] = {
     val udfQuery = udfIdsOpt match {
-      case Some(udfIds) => udfTable.filter(_.id inSet (udfIds))
-      case None => udfTable
+      case Some(udfIds) => udfTable.filter(_.id inSet (udfIds)).filter(_.streamType === "flink")
+      case None => udfTable.filter(_.streamType === "flink")
     }
     try {
       Await.result(db.run((flowUdfTable.filter(_.flowId inSet flowIds) join udfQuery on (_.udfId === _.id))
         .map {
-          case (flowUdf, udf) => (flowUdf.udfId, udf.functionName, udf.fullClassName, udf.jarName) <> (FlowUdfResponse.tupled, FlowUdfResponse.unapply)
+          case (flowUdf, udf) => (flowUdf.udfId, udf.functionName, udf.fullClassName, udf.jarName, udf.mapOrAgg) <> (FlowUdfResponse.tupled, FlowUdfResponse.unapply)
         }.result).mapTo[Seq[FlowUdfResponse]], minTimeOut)
     } catch {
       case ex: Exception =>

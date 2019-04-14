@@ -23,32 +23,29 @@ package edp.wormhole.sinks.hbasesink
 import edp.wormhole.hbaseconnection._
 import edp.wormhole.publicinterface.sinks.{SinkProcessConfig, SinkProcessor}
 import edp.wormhole.sinks.SourceMutationType
-import org.apache.hadoop.hbase.client._
-import org.apache.hadoop.hbase.util.Bytes
-import edp.wormhole.ums.UmsSysField._
-import edp.wormhole.ums.UmsOpType._
-
-import scala.collection.mutable.ListBuffer
-import scala.collection.mutable
 import edp.wormhole.sinks.utils.SinkDefault._
 import edp.wormhole.ums.UmsFieldType._
 import edp.wormhole.ums.UmsNamespace
-import edp.wormhole.ums.UmsProtocolType.UmsProtocolType
+import edp.wormhole.ums.UmsOpType._
+import edp.wormhole.ums.UmsSysField._
 import edp.wormhole.util.JsonUtils
 import edp.wormhole.util.config.ConnectionConfig
+import org.apache.hadoop.hbase.client._
+import org.apache.hadoop.hbase.util.Bytes
 import org.apache.log4j.Logger
+
+import scala.collection.mutable
+import scala.collection.mutable.ListBuffer
 
 class Data2HbaseSink extends SinkProcessor{
   private lazy val logger = Logger.getLogger(this.getClass)
-  override def process(protocolType: UmsProtocolType,
-                       sourceNamespace: String,
+  override def process(sourceNamespace: String,
                        sinkNamespace: String,
                        sinkProcessConfig: SinkProcessConfig,
                        schemaMap: collection.Map[String, (Int, UmsFieldType, Boolean)],
                        tupleList: Seq[Seq[String]],
                        connectionConfig: ConnectionConfig): Unit = {
     HbaseConnection.initHbaseConfig(sinkNamespace,  connectionConfig)
-
     def rowkey(rowkeyConfig: Seq[RowkeyPatternContent], recordValue: Seq[String]): String = {
       val keydatas = rowkeyConfig.map(rowkey => {
 

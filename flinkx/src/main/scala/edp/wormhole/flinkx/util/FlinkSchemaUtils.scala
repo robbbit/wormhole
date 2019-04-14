@@ -22,44 +22,50 @@ package edp.wormhole.flinkx.util
 
 import java.sql.{Date, Timestamp}
 
+import com.alibaba.fastjson.JSONObject
 import edp.wormhole.externalclient.zookeeper.WormholeZkClient
 import edp.wormhole.flinkx.common.WormholeFlinkxConfig
+import edp.wormhole.flinkx.swifts.FlinkxSwiftsConstants
 import edp.wormhole.kafka.WormholeKafkaConsumer
-import edp.wormhole.swifts.SwiftsConstants
 import edp.wormhole.ums.UmsFieldType._
 import edp.wormhole.ums.UmsProtocolType.{DATA_BATCH_DATA, DATA_INCREMENT_DATA, DATA_INITIAL_DATA}
 import edp.wormhole.ums.{UmsCommonUtils, UmsSchema, UmsSysField}
 import edp.wormhole.util.DateUtils
-import org.apache.flink.api.common.typeinfo.{BasicArrayTypeInfo, TypeInformation}
+import org.apache.flink.api.common.typeinfo.{BasicArrayTypeInfo, SqlTimeTypeInfo, TypeInformation}
 import org.apache.flink.table.api.{TableSchema, Types}
+import org.apache.flink.table.typeutils.TimeIndicatorTypeInfo
 import org.apache.kafka.clients.consumer.{ConsumerRecord, ConsumerRecords}
 import org.apache.log4j.Logger
 
 import scala.collection.mutable
+import scala.collection.mutable.ListBuffer
 
 object FlinkSchemaUtils extends java.io.Serializable {
 
   private val logger = Logger.getLogger(this.getClass)
   val sourceSchemaMap = mutable.HashMap.empty[String, (TypeInformation[_], Int)]
 
+  lazy val immutableSourceSchemaMap: Map[String, (TypeInformation[_], Int)] = sourceSchemaMap.toMap
+
   val swiftsProcessSchemaMap = mutable.HashMap.empty[String, Map[String, (TypeInformation[_], Int)]]
 
-  def sourceFieldNameArray: Array[String] = getFieldNamesFromSchema(sourceSchemaMap.toMap)
+  def sourceFieldNameArray: Array[String] = getFieldNamesFromSchema(immutableSourceSchemaMap)
 
-  def sourceFlinkTypeArray: Array[TypeInformation[_]] = sourceFieldNameArray.map(field => sourceSchemaMap(field)._1)
+  def sourceFlinkTypeArray: Array[TypeInformation[_]] = sourceFieldNameArray.map(field => immutableSourceSchemaMap(field)._1)
 
-  def sourceFieldIndexArray: Array[Int] = sourceFieldNameArray.map(field => sourceSchemaMap(field)._2)
+  def sourceFieldIndexArray: Array[Int] = sourceFieldNameArray.map(field => immutableSourceSchemaMap(field)._2)
 
   def setSourceSchemaMap(umsSchema: UmsSchema): Unit = {
     val fields = umsSchema.fields_get
-    sourceSchemaMap += SwiftsConstants.PROTOCOL_TYPE -> (Types.STRING, 0)
-    var index = 1
+    var index = 0
     fields.foreach {
       field =>
         sourceSchemaMap += field.name -> (umsType2FlinkType(field.`type`), index)
         index += 1
     }
   }
+
+  val udfSchemaMap = mutable.HashMap.empty[String, TypeInformation[_]]
 
   def setSwiftsSchema(key: String, value: Map[String, (TypeInformation[_], Int)]): Unit = {
     if (!FlinkSchemaUtils.swiftsProcessSchemaMap.contains(key))
@@ -76,29 +82,66 @@ object FlinkSchemaUtils extends java.io.Serializable {
     newArray
   }
 
-  def tableFieldNameArray(tableSchema: TableSchema): Array[String] = {
-    tableSchema.getColumnNames
+  def tableFieldTypeArray(tableSchema: TableSchema, preSchemaMap: Map[String, (TypeInformation[_], Int)]): Array[TypeInformation[_]] = {
+    tableSchema.getFieldNames.map(fieldName => {
+      val fieldType = preSchemaMap(fieldName)._1
+      if (fieldType == TimeIndicatorTypeInfo.PROCTIME_INDICATOR || fieldType == TimeIndicatorTypeInfo.ROWTIME_INDICATOR)
+        SqlTimeTypeInfo.TIMESTAMP
+      else fieldType
+    })
   }
 
-  def tableFieldTypeArray(tableSchema: TableSchema): Array[TypeInformation[_]] = {
-    tableFieldNameArray(tableSchema).map(fieldName => tableSchema.getType(fieldName).get)
-  }
+  def getSchemaMapFromTable(tableSchema: TableSchema, projectClause: String, udfSchemaMap: Map[String, TypeInformation[_]], specialConfigObj: JSONObject): Map[String, (TypeInformation[_], Int)] = {
+    logger.debug("in getSchemaMapFromTable *******************")
+    logger.debug("projectClause: " + projectClause)
+    val fieldString = projectClause.substring(6)
+    logger.debug("fieldString: " + fieldString)
 
-  def getSchemaMapFromTable(tableSchema: TableSchema): Map[String, (TypeInformation[_], Int)] = {
-    println("in getSchemaMapFromTable *******************")
+    val nameMap = mutable.HashMap.empty[String, String]
+    var s = ""
+    var num = 0
+    for (sIndex <- 0 until fieldString.length) {
+      if (fieldString(sIndex) == ',' && num == 0) {
+        if (s.contains('(') && s.contains("as")) {
+          val udfName = s.trim.substring(0, s.trim.indexOf('('))
+          val newName = s.trim.substring(s.indexOf("as") + 2).trim
+          nameMap += newName -> udfName
+        }
+        s = ""
+      } else {
+        if (fieldString(sIndex) == '(') num += 1
+        else if (fieldString(sIndex) == ')') num -= 1
+        s = s + fieldString(sIndex)
+      }
+    }
+    if (s.contains('(') && s.contains("as")) {
+      val udfName = s.trim.substring(0, s.trim.indexOf('('))
+      val newName = s.trim.substring(s.indexOf("as") + 2).trim
+      nameMap += newName -> udfName
+    }
+    logger.debug("nameMap:" + nameMap.toString())
+
     val resultSchemaMap = mutable.HashMap.empty[String, (TypeInformation[_], Int)]
     var index = 0
-    tableSchema.getColumnNames.foreach(s => {
-      logger.info(s"field $index in table $s")
-      resultSchemaMap += s -> (tableSchema.getType(s).get, index)
+    var udfIndexCur = 0
+    tableSchema.getFieldNames.foreach(s => {
+      logger.debug(s"field $index in table $s")
+      if (tableSchema.getFieldType(s).get.toString.contains("java.lang.Object") && udfSchemaMap.contains(nameMap(s))) {
+        resultSchemaMap += s -> (udfSchemaMap(nameMap(s)), index)
+        udfIndexCur += 1
+      } else {
+        resultSchemaMap += s -> (tableSchema.getFieldType(s).get, index)
+      }
       index += 1
     }
     )
+    if (null != specialConfigObj && specialConfigObj.containsKey(FlinkxSwiftsConstants.PRESERVE_MESSAGE_FLAG) && specialConfigObj.getBooleanValue(FlinkxSwiftsConstants.PRESERVE_MESSAGE_FLAG)) {
+      resultSchemaMap += FlinkxSwiftsConstants.MESSAGE_FLAG -> (Types.BOOLEAN, index)
+    }
     resultSchemaMap.toMap
   }
 
   def getSchemaMapFromArray(fieldNames: Array[String], fieldTypes: Array[TypeInformation[_]]): Map[String, (TypeInformation[_], Int)] = {
-    println("in getSchemaMapFromArray &&&&&&&&&&&&&&&&&&")
     val resultSchemaMap = mutable.HashMap.empty[String, (TypeInformation[_], Int)]
     for (i <- fieldNames.indices) {
       resultSchemaMap += fieldNames(i) -> (fieldTypes(i), i)
@@ -106,19 +149,8 @@ object FlinkSchemaUtils extends java.io.Serializable {
     resultSchemaMap.toMap
   }
 
-  def getOutputFieldNames(outputFieldList: Array[String], keyByFields: String): Array[String] = {
-    val outputFieldSize: Int = outputFieldList.length
-    val outputFieldNames = for (i <- 0 until outputFieldSize)
-      yield outputFieldList(i).split(":").head
-    if (keyByFields != null && keyByFields.nonEmpty)
-      Array(SwiftsConstants.PROTOCOL_TYPE.toString, UmsSysField.ID.toString, UmsSysField.TS.toString, UmsSysField.OP.toString) ++
-        keyByFields.split(";") ++ outputFieldNames
-    else
-      Array(SwiftsConstants.PROTOCOL_TYPE.toString, UmsSysField.ID.toString, UmsSysField.TS.toString, UmsSysField.OP.toString) ++
-        outputFieldNames
-  }
 
-  def getOutPutFieldTypes(fieldNames: Array[String], schemaMap: Map[String, (TypeInformation[_], Int)]): Array[TypeInformation[_]] = {
+  def getFieldTypes(fieldNames: Array[String], schemaMap: Map[String, (TypeInformation[_], Int)]): Array[TypeInformation[_]] = {
     fieldNames.map(field => {
       schemaMap(field)._1
     })
@@ -131,7 +163,7 @@ object FlinkSchemaUtils extends java.io.Serializable {
   }
 
   def findJsonSchema(config: WormholeFlinkxConfig, zkAddress: String, zkPath: String, sourceNamespace: String): UmsSchema = {
-    val consumer = WormholeKafkaConsumer.initConsumer(config.kafka_input.kafka_base_config.brokers, config.kafka_input.kafka_base_config.group_id, None)
+    val consumer = WormholeKafkaConsumer.initConsumer(config.kafka_input.kafka_base_config.brokers, config.kafka_input.kafka_base_config.group_id, None, config.kerberos)
     WormholeKafkaConsumer.subscribeTopicFromOffset(consumer, new WormholeFlinkxConfigUtils(config).getTopicOffsetMap)
     var correctData = false
     var record: UmsSchema = null
@@ -142,23 +174,23 @@ object FlinkSchemaUtils extends java.io.Serializable {
           val it = records.iterator()
           while (it.hasNext && !correctData) {
             val r: ConsumerRecord[String, String] = it.next()
-            println(r.offset() + " offset")
+            logger.debug(r.offset() + " offset")
             val (key, value) = (r.key(), r.value())
-            println("key is " + key)
+            logger.debug("key is " + key)
             val key2Verify = UmsCommonUtils.checkAndGetKey(key, value)
-            println("key2Verify " + key2Verify)
+            logger.debug("key2Verify " + key2Verify)
             correctData = isCorrectRecord(key2Verify, value, sourceNamespace)
             if (correctData) {
-              println(s"the true value $value")
+              logger.debug(s"the true value $value")
               val ums = UmsCommonUtils.json2Ums(value)
               if (ums.payload.isEmpty || ums.schema.fields.isEmpty || !matchNamespace(ums.schema.namespace, sourceNamespace)) {
-                println("ums is not correct")
+                logger.debug("ums is not correct")
                 correctData = false
               }
               else record = ums.schema
             }
           }
-        } else logger.info("continue")
+        } else logger.debug("continue")
       }
     } catch {
       case e: Throwable => logger.error("findJsonSchema", e)
@@ -176,7 +208,7 @@ object FlinkSchemaUtils extends java.io.Serializable {
     if ((umsProtocolType == DATA_INITIAL_DATA || umsProtocolType == DATA_INCREMENT_DATA || umsProtocolType == DATA_BATCH_DATA) && matchNamespace(namespace, sourceNamespace)) {
       true
     } else {
-      logger.info("continue")
+      logger.debug("continue")
       false
     }
   }
@@ -184,15 +216,15 @@ object FlinkSchemaUtils extends java.io.Serializable {
 
   def matchNamespace(dataNamespace: String, sourceNamespace: String): Boolean = {
     val dataNamespacePart = dataNamespace.split("\\.")
-    println("the dataNamespace is " + dataNamespace)
+    logger.debug("the dataNamespace is " + dataNamespace)
     val sourceNamespacePart = sourceNamespace.split("\\.")
-    println("the sourceNamespace is " + sourceNamespace)
+    logger.debug("the sourceNamespace is " + sourceNamespace)
     var compareNum = 4
     if (sourceNamespacePart(4) == "*") compareNum = 4
     else if (sourceNamespacePart(5) == "*") compareNum = 5
     else if (sourceNamespacePart(6) == "*") compareNum = 6
     else compareNum = 7
-    println("the final compareNum is " + compareNum)
+    logger.debug("the final compareNum is " + compareNum)
     dataNamespacePart.slice(0, compareNum).mkString("") == sourceNamespacePart.slice(0, compareNum).mkString("")
   }
 
@@ -222,6 +254,7 @@ object FlinkSchemaUtils extends java.io.Serializable {
       case Types.SQL_DATE => DATE
       case Types.SQL_TIMESTAMP => DATETIME
       case Types.DECIMAL => DECIMAL
+      //case _ => INT
     }
 
   }
@@ -245,13 +278,22 @@ object FlinkSchemaUtils extends java.io.Serializable {
 
   def object2TrueValue(flinkType: TypeInformation[_], value: Any): Any = if (value == null) null
   else flinkType match {
-    case Types.STRING => value.asInstanceOf[String].trim
+    case Types.STRING =>  value.asInstanceOf[String].trim
     case Types.INT => value.asInstanceOf[Int]
-    case Types.LONG => value.asInstanceOf[Long]
+    case Types.LONG => value match {
+      case _: Int => value.asInstanceOf[Int].toLong
+      case _ => value.asInstanceOf[Long]
+    }
     case Types.FLOAT => value.asInstanceOf[Float]
-    case Types.DOUBLE => value.asInstanceOf[Double]
+    case Types.DOUBLE => value match {
+      case _: Float => value.asInstanceOf[Float].toDouble
+      case _ => value.asInstanceOf[Double]
+    }
     case Types.BOOLEAN => value.asInstanceOf[Boolean]
-    case Types.SQL_DATE => if(value.isInstanceOf[Timestamp])DateUtils.dt2sqlDate(value.asInstanceOf[Timestamp]) else DateUtils.dt2sqlDate(value.asInstanceOf[Date])
+    case Types.SQL_DATE => value match {
+      case _:Timestamp => DateUtils.dt2sqlDate(value.asInstanceOf[Timestamp])
+      case _=>DateUtils.dt2sqlDate(value.asInstanceOf[Date])
+    }
     case Types.SQL_TIMESTAMP => value.asInstanceOf[Timestamp]
     case Types.DECIMAL => new java.math.BigDecimal(value.asInstanceOf[java.math.BigDecimal].toPlainString.trim).stripTrailingZeros()
     case _ => throw new UnsupportedOperationException(s"Unknown Type: $flinkType")
@@ -271,24 +313,15 @@ object FlinkSchemaUtils extends java.io.Serializable {
     case _ => throw new UnsupportedOperationException(s"Unknown Type: $flinkType")
   }
 
-  def getRelValue(fieldIndex: Int, value: String, schemaMap: Map[String, (TypeInformation[_], Int)]): Any = if (value == null) null
-  else {
-    val fieldNames = getFieldNamesFromSchema(schemaMap)
-    val flinkTypes = fieldNames.map(field => schemaMap(field)._1)
-    flinkTypes(fieldIndex) match {
-      case Types.STRING => value.trim
-      case Types.INT => value.trim.toInt
-      case Types.LONG => value.trim.toLong
-      case Types.FLOAT => value.trim.toFloat
-      case Types.DOUBLE => value.trim.toDouble
-      case Types.BOOLEAN => value.trim.toBoolean
-      case Types.SQL_DATE => DateUtils.dt2sqlDate(value.trim)
-      case Types.SQL_TIMESTAMP => DateUtils.dt2timestamp(value.trim)
-      case Types.DECIMAL => new java.math.BigDecimal(value.trim).stripTrailingZeros()
-      case _ => throw new UnsupportedOperationException(s"Unknown Type: ${
-        flinkTypes(fieldIndex)
-      }")
+  def getRelValue(fieldIndex: Int, value: String, schemaMap: Map[String, (TypeInformation[_], Int)]): Any =
+    if (value == null) null
+    else {
+      val fieldNames = getFieldNamesFromSchema(schemaMap)
+      val flinkTypes = fieldNames.map(field => schemaMap(field)._1)
+      s2TrueValue(flinkTypes(fieldIndex), value)
     }
-  }
 
+  def checkOtherData(protocolType: String): Boolean = {
+    protocolType.startsWith("directive_") || protocolType.endsWith("_heartbeat") || protocolType.endsWith("_termination")
+  }
 }

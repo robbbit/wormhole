@@ -25,6 +25,7 @@ import java.sql._
 
 import edp.wormhole.dbdriver.dbpool.DbConnection
 import edp.wormhole.sinks.SourceMutationType.SourceMutationType
+import edp.wormhole.sinks.kafkasink.OracleSequenceConfig
 import edp.wormhole.sinks.utils.SinkDefault._
 import edp.wormhole.ums.UmsDataSystem.UmsDataSystem
 import edp.wormhole.ums.{UmsFieldType, UmsOpType, UmsSysField, _}
@@ -36,8 +37,9 @@ import org.apache.log4j.Logger
 import scala.collection.mutable
 import scala.collection.mutable.ListBuffer
 
-object SqlProcessor  {
+object SqlProcessor {
   private lazy val logger = Logger.getLogger(this.getClass)
+
   def selectMysqlSql(tupleCount: Int, tableKeyNames: Seq[String], tableName: String, sysIdName: String): String = {
     val keysString = tableKeyNames.map(tk =>s"""`$tk`""").mkString(",")
     val keyQuestionMarks = (1 to tableKeyNames.size).map(_ => "?").mkString("(", ",", ")")
@@ -171,11 +173,19 @@ object SqlProcessor  {
   }
 
   def getInsertSql(sourceMutationType: SourceMutationType, dataSys: UmsDataSystem, tableName: String, systemRenameMap: Map[String, String],
-                   allFieldNames: Seq[String]): String = {
+                   allFieldNames: Seq[String], oracleSequenceConfig: Option[OracleSequenceConfig]=None): String = {
+    println("oracleSequenceConfig:"+oracleSequenceConfig)
     val columnNames = getSqlField(allFieldNames, systemRenameMap, UmsOpType.INSERT, dataSys)
     val oracleColumnNames = getSqlField(allFieldNames, systemRenameMap, UmsOpType.INSERT, dataSys)
     val sql = dataSys match {
       case UmsDataSystem.MYSQL => s"INSERT INTO `$tableName` ($columnNames) VALUES " + (1 to allFieldNames.size).map(_ => "?").mkString("(", ",", ")")
+      case UmsDataSystem.ORACLE =>
+        if (oracleSequenceConfig.nonEmpty) {
+          val fieldName = oracleSequenceConfig.get.field_name
+          val sequenceName = oracleSequenceConfig.get.sequence_name + ".NEXTVAL"
+          s"""INSERT INTO ${tableName.toUpperCase} ($fieldName,$oracleColumnNames) VALUES """ + (1 to allFieldNames.size).map(_ => "?").mkString("(" + sequenceName + " ,", ",", ")")
+        } else
+          s"""INSERT INTO ${tableName.toUpperCase} ($oracleColumnNames) VALUES """ + (1 to allFieldNames.size).map(_ => "?").mkString("(", ",", ")")
       case _ => s"""INSERT INTO ${tableName.toUpperCase} ($oracleColumnNames) VALUES """ + (1 to allFieldNames.size).map(_ => "?").mkString("(", ",", ")")
     }
 
@@ -271,45 +281,39 @@ object SqlProcessor  {
     var ps: PreparedStatement = null
     val errorTupleList: mutable.ListBuffer[Seq[String]] = mutable.ListBuffer.empty[Seq[String]]
     var conn: Connection = null
-    var index = 0 - batchSize
+    val index = 0 - batchSize
     try {
       conn = DbConnection.getConnection(connectionConfig)
       conn.setAutoCommit(false)
       logger.info("create connection successfully,batchsize:" + batchSize + ",tupleList:" + tupleList.size)
       ps = conn.prepareStatement(sql)
-      tupleList.sliding(batchSize, batchSize).foreach(tuples => {
-        index += batchSize
-        for (i <- tuples.indices) {
-          setPlaceholder(opType, tuples(i), ps, fieldNames, renameSchema, systemRenameMap, tableKeyNames, sysIdName)
-          ps.addBatch()
-        }
-        try {
-          logger.info("execute batch start***")
-          ps.executeBatch()
-          logger.info("execute batch end***")
-          conn.commit()
-        } catch {
-          case e: Throwable =>
-            logger.error("executeBatch error " + e)
-            errorTupleList ++= tuples
-            if (batchSize == 1)
-              logger.info("violate tuple -----------" + tuples)
-        } finally {
-          ps.clearBatch()
-        }
-      })
+      for (i <- tupleList.indices) {
+        setPlaceholder(opType, tupleList(i), ps, fieldNames, renameSchema, systemRenameMap, tableKeyNames, sysIdName)
+        ps.addBatch()
+      }
+      logger.info("execute batch start***")
+      ps.executeBatch()
+      logger.info("execute batch end***")
+      conn.commit()
     } catch {
       case e: SQLTransientConnectionException => DbConnection.resetConnection(connectionConfig)
-        logger.error("SQLTransientConnectionException" + e)
+        logger.error("SQLTransientConnectionException", e)
         logger.info("out batch ")
         if (index <= 0) errorTupleList ++= tupleList
         else errorTupleList ++= tupleList.takeRight(tupleList.size - index)
       case e: Throwable =>
-        logger.error("get connection failed" + e)
-        if (index <= 0) errorTupleList ++= tupleList
-        else errorTupleList ++= tupleList.takeRight(tupleList.size - index)
-    }
-    finally {
+        logger.error("executeBatch error ", e)
+        errorTupleList ++= tupleList
+        if (batchSize == 1)
+          logger.info("violate tuple -----------" + tupleList)
+        try {
+          conn.rollback()
+        } catch {
+          case e: Throwable => logger.warn("rollback error", e)
+        }
+        logger.error("get connection failed", e)
+    } finally {
+      ps.clearBatch()
       if (ps != null)
         try {
           ps.close()
@@ -324,6 +328,7 @@ object SqlProcessor  {
           case e: Throwable => logger.error("conn.close", e)
         }
     }
+
     errorTupleList.toList
   }
 }

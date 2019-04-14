@@ -86,7 +86,7 @@ Stream 状态转换图如下，其中 refresh 代表 Refresh 按钮，start 代�
 
 #### 类型
 
-Flink中支持的Stream类型只有default，理论上可以处理所有类型的数据，将数据写入Kafka/RDBS/Elasticsearch/Hbase/Phoenix/Cassandra/MongoDB系统中，但目前只支持处理UMS数据类型，目标系统只支持Kafka，UMS_Extension类型及其他目标系统会在后续版本支持
+Flink中支持的Stream类型只有default，支持异构sink，包括Kafka/RDBS/Elasticsearch/Hbase/Phoenix/Cassandra/MongoDB系统中，数据类型支持处理UMS数据类型和用户自定义UMS_Extension类型
 
 <img src="https://github.com/edp963/wormhole/raw/master/docs/img/user-stream-type-flink.png" alt="" width="600"/>
 
@@ -129,15 +129,17 @@ Flink中支持的Stream类型只有default，理论上可以处理所有类型�
 - 若 Wormhole 未对接 DBus，源数据系统只支持 Kafka
 - 若 Wormhole 已对接 DBus，选择在 DBus 中配置的源数据系统类型
 - 可选的 Namespace 有一定的权限控制，其中 Source Namespace 是 Stream 对应 Kafka Instance 下的 Namespaces 与 Flow 所在 Project 下可访问 Namespaces 的交集；Sink Namespace 是 Flow 所在 Project 下可访问的Namespaces 且去除从 DBus 系统同步的 Namespace
-- 注：Flink Flow暂时只支持UMS类型数据源，用户自定义json类型数据源将在后续版本进行支持
 
 ### Sink Namespace
 
 Sink Namespace 对应的物理表需要提前创建，表的 Schema 中是否需要创建 UMS 系统字段 `ums_id_（long 类型）, ums_ts_（datetime 类型）, ums_active_（int 类型）`，根据以下策略判断须增加的字段：
 
-- 源数据为 UMS 类型，则 Sink 表中需添加三个字段
-- 源数据为 UMS_Extension 类型，若源数据 Schema 中配置了 `ums_ts_` 字段，Sink 表中须增加 `ums_ts_` 字段；若源数据 Schema 中配置了 `ums_ts_, ums_id_` 字段，Sink 表中须增加 `ums_ts_, ums_id_` 字段；若源数据 Schema 中配置了 `ums_id_（long 类型）, ums_ts_（datetime 类型）, ums_op_（string 类型）` 字段，Sink 表中须增加 `ums_id_, ums_ts_, ums_active_` 字段。（注意：如果只配置了 `ums_ts_` 字段，向 Sink 表中写数据时只能选择 insert only 类型）
-- 注：Flink Flow暂时只支持写入kafka系统，其他系统将在后续版本进行支持
+- 源数据为 UMS 类型，为实现幂等更新和最终一致性，流处理的最后结果会保留上述三个字段，Sink 表中必须添加上述三个字段
+- 源数据为 UMS_Extension 类型，以用户配置的SQL及Result Fields为准
+
+### Table Keys
+
+设置sink表的table keys，用于幂等的实现。如果有多个，用逗号隔开。
 
 ### Result Fields
 
@@ -145,8 +147,26 @@ Sink Namespace 对应的物理表需要提前创建，表的 Schema 中是否需
 
 ### Sink Config
 
-- Sink Config 项配置与所选系统类型相关，点击配置按钮后页面上方有对应系统的配置项例子
-- 其中 "mutation_type" 的值有 "i" 和 "iud"，代表向 Sink 表中插数据时使用只增原则或增删改原则。如果为 "iud"，源数据中须有 `ums_id_（long 类型）, ums_ts_（datetime 类型）, ums_op_（string 类型）` 字段，Sink 表中都须有 `ums_id_（long 类型）, ums_ts_（datetime 类型）, ums_active_（int 类型）` 字段。若不配置此项，默认为 "iud"
+Sink Config 项配置与所选系统类型相关，点击配置按钮后页面上方有对应系统的配置项例子
+
+#### 配置数据插入方式（只增加or增删改）
+
+其中 "mutation_type" 的值有 "i" 和 "iud"，代表向 Sink 表中插数据时使用只增原则或增删改原则。如果为 "iud"，源数据中须有 `ums_id_（long 类型）, ums_ts_（datetime 类型）, ums_op_（string 类型）` 字段，Sink 表中都须有 `ums_id_（long 类型）, ums_ts_（datetime 类型）, ums_active_（int 类型）` 字段。若不配置此项，默认为 "iud"
+
+**注意事项：**
+
+- 源数据为 UMS_Extension 类型时，若"mutation_type"为"iud"，源schema中必须配置与ums三个系统字段的映射，并且SQL中须显示选出这三个系统字段
+
+
+#### 分表幂等
+
+针对关系型数据库，为了减小ums_id、ums_op与ums_ts字段对业务系统的侵入性，可单独将这三个字段和table keys单独建立一个表，原业务表保持不变。假设ums_id、ums_op、ums_ts和table key组成的表名为umsdb，那么分表幂等的配置为：
+
+`{"mutation_type":"split_table_idu","db.function_table":"umsdb"}`
+
+#### 配置安全认证的sink kafka
+
+在用户需要向启用了kerberos安全认证的kafka集群Sink数据时，需要在sink config里面做如下配置：{"kerberos":true}，默认情况下，是向未启用kerberos认证的kafka集群Sink数据（0.6.1及之后版本）
 
 ### Transformation
 
@@ -162,7 +182,7 @@ Sink Namespace 对应的物理表需要提前创建，表的 Schema 中是否需
   <dependency>
      <groupId>edp.wormhole</groupId>
      <artifactId>wormhole-sparkxinterface</artifactId>
-     <version>0.5.2-beta</version>
+     <version>0.6.0</version>
   </dependency>
   ```
 
@@ -172,7 +192,7 @@ Sink Namespace 对应的物理表需要提前创建，表的 Schema 中是否需
 
   安装wormhole-sparkxinterface包至本地maven仓库
 
-  wormhole/common/util目录下执行
+  wormhole/util目录下执行
 
   mvn clean install package
 
@@ -180,16 +200,16 @@ Sink Namespace 对应的物理表需要提前创建，表的 Schema 中是否需
 
   mvn clean install package
 
-  wormhole/common/sparkxinterface目录下执行
+  wormhole/interface/sparkxinterface目录下执行
 
   mvn clean install package
   ```
 
-- 继承 并实现 wormhole/common/sparkxinterface module 下的 edp.wormhole.sparkxinterface.swifts.SwiftsInterface 接口，可参考 wormhole/sparkx module 下的 edp.wormhole.swifts.custom.CustomTemplate 类
+- 继承 并实现 wormhole/interface/sparkxinterface module 下的 edp.wormhole.sparkxinterface.swifts.SwiftsInterface 接口，可参考 wormhole/sparkx module 下的 edp.wormhole.sparkx.swifts.custom.CustomTemplate 类
 
 - 编译打包，将带有 Dependencies 的 Jar 包放置在 $SPARK_HOME/jars 目录下
 
-- 页面配置时，选择 Custom Class，输入方法名全路径，如 edp.wormhole.swifts.custom.CustomTemplate
+- 页面配置时，选择 Custom Class，输入方法名全路径，如 edp.wormhole.sparkx.swifts.custom.CustomTemplate
 
 - Flow 启动或生效，重启 Stream
 
@@ -199,7 +219,15 @@ Sink Namespace 对应的物理表需要提前创建，表的 Schema 中是否需
 
 Lookup SQL 可以关联流下其他系统数据，如 RDBS/Hbase/Redis/Elasticsearch 等，规则如下。
 
-若 Source Namespace 为 kafka.edp_kafka.udftest.udftable，Lookup Table 为 RDBMS 系统，如 mysql.er_mysql.eurus_test 数据库下的 eurususer 表，Left Join 关联字段是 id，name，且从 Lookup 表中选择的字段 id，name 与主流上kafka.edp_kafka.udftest.udftable 中的字段重名，SQL语句如下：
+若 Source Namespace 为 kafka.edp_kafka.udftest.udftable，Lookup Table 为 RDBMS 系统，如 mysql.er_mysql.eurus_test 数据库下的 eurus_user 表，Left Join 关联字段是 id，name，且从 Lookup 表中选择的字段 id，name 与主流上kafka.edp_kafka.udftest.udftable 中的字段重名，0.6.0及以上版本支持两种类型的Lookup SQL语句如下：
+
+（1）主流上的字段名用${}标注（0.6.0及以上版本支持），推荐使用该种方式，例如
+
+```
+select id as id1,name as name1,address,age from eurus_user where (id,name) in (${id},${name});
+```
+
+（2）主流上的字段名用namespace.filedName进行标注，例如
 
 ```
 select id as id1, name as name1, address, age from eurus_user where (id, name) in (kafka.edp_kafka.udftest.udftable.id, kafka.edp_kafka.udftest.udftable.name);
@@ -223,7 +251,8 @@ Spark SQL 用于处理 Source Namespace 数据，from 后面直接接表名即�
 
 - 选择要关联的其他 Source Namespace，可关联多个 Source Namespace
 - Stream Join SQL 处理过程中会将没有关联上的数据保存到 HDFS 上，data retention time 代表数据的有效期
-- select 语句规则同 Spark SQL
+- select 语句规则同 Lookup SQL
+
 
 #### Flink Flow Transformation
 
@@ -263,7 +292,7 @@ Wormhole Flink版对传输的流数据除了提供Lookup SQL、Flink SQL两种Tr
 
 4）Output：输出结果的形式，大致分为三类：Agg、Detail、FilteredRow
 
-- Agg：将匹配的多条数据做聚合，生成一条数据输出,例：field1:avg,field2:max（目前支持max/min/avg/sum）
+- Agg：将匹配的多条数据做聚合，生成一条数据输出,例：field1:avg,field2:max（目前支持max/min/avg/sum/count，count为0.6.0版本新增功能）
 - Detail：将匹配的多条数据逐一输出
 - FilteredRow：按条件选择指定的一条数据输出，例：head/last/ field1:min/max
 
@@ -282,13 +311,142 @@ Wormhole Flink版对传输的流数据除了提供Lookup SQL、Flink SQL两种Tr
 
 ##### SQL
 
-####### Lookup SQL
+Lookup SQL具体可参考Spark Flow Transformation的Lookup SQL章节
 
-具体可参考Spark Flow Transformation的Lookup SQL章节
+Flink SQL 用于处理 Source Namespace 数据，from 后面直接接表名即可。Wormhole 0.6.0-beata及之后版本的Flinkx支持window，UDF和UDAF操作。0.6.0版本Flink SQL支持key by操作，key by字段在Transformation Config中进行配置，设置格式为json，其中json中key为key_by_fields，value为key by的字段，如果有多个字段，则用逗号分隔，例如：{"key_by_fields":"name,city"}
 
-####### Flink SQL
+###### Window
 
-Flink SQL 用于处理 Source Namespace 数据，from 后面直接接表名即可。Flink SQL UDF 功能会在后续版本支持。
+process time处理方式中window中相应的字段名称为processing_time。例：SELECT name, SUM(key) as keysum from ums GROUP BY TUMBLE(processing_time, INTERVAL '1' HOUR), name;
+
+event time处理方式中window中相应的字段名称为ums_ts_。例：SELECT name, SUM(key) as keysum from ums GROUP BY TUMBLE(ums_ts_, INTERVAL '1' HOUR), name;
+
+相关配置包括：
+
+- min_idle_state_retention_time：聚合相关key值状态被保留的最短时间，默认12hours
+
+- max_idle_state_retention_time：聚合相关key值状态被保留的最长时间，默认24hours
+
+- preserve_message_flag：table to stream的转换采用的是retractStream，用户可以选择是否保留数据流中的message_flag字段。如果不保留，该参数配置为false，Wormhole会去掉message_flag字段；若保留，改参数配置为true，Wormhole会在Row中增加一个field，用来保存message_flag字段。默认为false
+
+  在Transformation Config中可对这三个参数进行配置，配置格式为json。例如：{"min_idle_state_retention_time":"10","max_idle_state_retention_time":"20","preserve_message_flag":"true"}
+
+
+
+###### UDF
+
+Wormhole Flink UDF支持普通的java程序，而不需要按照Flink官方文档的格式实现UDF。UDF名称大小写敏感。UDF相应的字段需要使用as指定新字段的名称。例如：
+
+Java程序：
+
+    public class addint {
+      public int fInt(int i) {
+          return i + 1;
+      }
+    }
+使用UDF的Flink SQL：
+
+    select intvalue, fInt(intvalue) as fint from mytable; 
+
+
+###### UDAF
+
+（1）使用UDAF需要进行以下操作
+
+- pom中添加 wormhole/flinkxinterface 依赖
+
+  ```
+  <dependency>
+     <groupId>edp.wormhole</groupId>
+     <artifactId>wormhole-flinkxinterface</artifactId>
+     <version>0.6.0</version>
+  </dependency>
+  ```
+
+- clone wormhole github 项目，本地安装 wormhole-flinkxinterface jar 包
+
+  ```
+  安装wormhole-flinkxinterface包至本地maven仓库
+
+  wormhole/interface/flinkxinterface目录下执行
+
+  mvn clean install package
+  ```
+
+- 继承 并实现 wormhole/interface/flinkxinterface module 下的 edp.wormhole.flinkxinterface.UdafInterface 接口。
+
+- 编译打包，将带有 Dependencies 的 Jar 包放置在 $FLINK_HOME/bin 目录下
+
+- 页面配置时，在admin用户下进行注册。
+
+- 重启 Stream，flow启动时，选择该UDAF。
+
+（2）UDAF例程：计算带权重的值的平均值
+
+- 首先需要定义一个累加器，该累加器是用来保存聚合的中间结果的数据结构
+
+  ```
+  public class WeightedAvgAccum {
+      public long sum = 0;
+      public int count = 0;
+      public WeightedAvgAccum(long sum, int count) {
+          this.sum = sum;
+          this.count = count;
+      }
+  }
+  ```
+
+- 创建聚合函数
+
+  - 覆盖createAccumulator()方法，通过该方法创建空的累加器
+  - 实现accumulate()方法（不需要进行覆盖），每个输入通过该方法更新累加器
+  - 覆盖getValue()方法，在处理完所有行之后，调用该方法计算并返回最终结果
+  - 对于over window需要实现retract()方法（不需要进行覆盖），否则可不实现该方法
+  - 对于session window需要覆盖merge()方法，否则可不实现该方法
+
+  ```
+  public class udafAvg extends UdafInterface <Long, WeightedAvgAccum> {
+      //创建空累加器
+      @Override
+      public WeightedAvgAccum createAccumulator() {
+          return new WeightedAvgAccum(0, 0);
+      }
+      //更新累加器
+      public void accumulate(WeightedAvgAccum acc, long value, int weight) {
+          acc.sum += Long.valueOf(String.valueOf(value)) * Integer.valueOf(String.valueOf(weight));
+          acc.count += Integer.valueOf(String.valueOf(weight));
+      }
+      //计算结果
+      @Override
+      public Long getValue(WeightedAvgAccum acc) {
+          if (acc.count == 0) {
+              return null;
+          } else {
+              return acc.sum / acc.count;
+          }
+      }
+  }
+  ```
+
+（3）使用UDAF的Flink SQL：
+
+```
+SELECT name, udafAvg(score,weight) as udafAvg from ums GROUP BY name;
+```
+
+##### 异常处理设置
+
+Flink中通过Transformation Config可选择对流处理中异常信息的处理方式。现在能捕获读取kafka后数据预处理、lookup操作、写sink时的异常。处理方式有三种：
+
+- 不设置或者设置为unhandle：对捕获的异常信息不进行处理，只显示在log中
+
+- 设置为interrupt：捕获到异常后，中断处理
+
+- 设置为feedback：将捕获到的异常回灌到kafka中
+
+  设置格式为json，例如：{"exception_process_method":"interrupt"}
+
+**注意：当在配置文件中设置checkpoint为true，则异常处理不能设置为interrupt，否则flow会一直重启。**
 
 ### 修改 Flow
 
@@ -305,6 +463,7 @@ Flink SQL 用于处理 Source Namespace 数据，from 后面直接接表名即�
 #### 启动 Flink Flow
 
 - Stream running状态下才可以启动Flow
+- 启动 Flow 时可以选择需要加载的 UDF，也可以取消已选择的 UDF
 - 配置每个Topic Partition消费的起始Offset，可配置用户自定义Topic
 - 点击启动按钮，后台会向对应Flink Stream JobManager上提交创建TaskManager请求
 - 启动Flow后可点击查看日志按钮，若创建成功状态会转至running状态，若创建失败状态会转至failed状态，可根据日志错误提示重新配置
@@ -368,6 +527,10 @@ Flink SQL 用于处理 Source Namespace 数据，from 后面直接接表名即�
 借助 Job 可轻松实现 Lambda 架构和 Kappa 架构。
 
 首先使用 hdfslog Stream 将源数据备份到 Hdfs，Flow 出错或需要重算时，可配置 Job 重算。具体配置可参考Stream 和 Flow。
+
+Job中Spark SQL表名为“increment”。例如：
+
+`select key, value from increment;`
 
 <img src="https://github.com/edp963/wormhole/raw/master/docs/img/user-guide-job-source.png" alt="" width="600"/>
 

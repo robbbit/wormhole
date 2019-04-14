@@ -21,6 +21,10 @@
 import {
   LOAD_USER_STREAMS,
   LOAD_USER_STREAMS_SUCCESS,
+  LOAD_FLOW_LIST,
+  LOAD_FLOW_LIST_SUCCESS,
+  SET_FLOW_PRIORITY,
+  SET_FLOW_PRIORITY_SUCCESS,
   LOAD_ADMIN_ALL_STREAMS,
   LOAD_ADMIN_ALL_STREAMS_SUCCESS,
   LOAD_ADMIN_SINGLE_STREAM,
@@ -52,7 +56,8 @@ import {
   STARTORRENEW_STREAMS_SUCCESS,
   OPERATE_STREAMS_ERROR,
   LOAD_LASTEST_OFFSET,
-  LOAD_LASTEST_OFFSET_SUCCESS
+  LOAD_LASTEST_OFFSET_SUCCESS,
+  JUMP_STREAM_TO_FLOW_FILTER
 } from './constants'
 import { fromJS } from 'immutable'
 
@@ -60,16 +65,39 @@ const initialState = fromJS({
   streams: false,
   streamSubmitLoading: false,
   streamNameExited: false,
-  streamStartModalLoading: false
+  streamStartModalLoading: false,
+  flowsLoading: true,
+  flowsPriorityConfirmLoading: false,
+  streamFilterId: ''
 })
+
+function compare (property) {
+  return function (a, b) {
+    var value1 = a[property]
+    var value2 = b[property]
+    return value1 - value2
+  }
+}
 
 function streamReducer (state = initialState, { type, payload }) {
   const streams = state.get('streams')
+
   switch (type) {
     case LOAD_USER_STREAMS:
       return state
     case LOAD_USER_STREAMS_SUCCESS:
       return state.set('streams', payload.streams)
+    case LOAD_FLOW_LIST:
+      return state.set('flowsLoading', true)
+    case LOAD_FLOW_LIST_SUCCESS:
+      const flows = Array.isArray(payload.flows) && payload.flows[0]
+            ? payload.flows.sort(compare('priorityId'))
+            : []
+      return state.set('flows', flows).set('flowsLoading', false)
+    case SET_FLOW_PRIORITY:
+      return state.set('flowsPriorityConfirmLoading', true)
+    case SET_FLOW_PRIORITY_SUCCESS:
+      return state.set('flowsPriorityConfirmLoading', false)
     case LOAD_ADMIN_ALL_STREAMS:
       return state.set('error', false)
     case LOAD_ADMIN_ALL_STREAMS_SUCCESS:
@@ -154,6 +182,8 @@ function streamReducer (state = initialState, { type, payload }) {
       return state
     case LOAD_LASTEST_OFFSET_SUCCESS:
       return state
+    case JUMP_STREAM_TO_FLOW_FILTER:
+      return state.set('streamFilterId', payload.streamFilterId)
     default:
       return state
   }

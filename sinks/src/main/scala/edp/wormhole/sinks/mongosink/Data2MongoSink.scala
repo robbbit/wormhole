@@ -30,7 +30,6 @@ import edp.wormhole.publicinterface.sinks.{SinkProcessConfig, SinkProcessor}
 import edp.wormhole.sinks.mongosink.MongoHelper._
 import edp.wormhole.sinks.{SourceMutationType, _IDHelper}
 import edp.wormhole.ums.UmsFieldType._
-import edp.wormhole.ums.UmsProtocolType.UmsProtocolType
 import edp.wormhole.ums.{UmsFieldType, _}
 import edp.wormhole.util.JsonUtils
 import edp.wormhole.util.config.ConnectionConfig
@@ -44,10 +43,10 @@ import org.mongodb.scala.{MongoClient, MongoClientSettings, MongoCollection, Mon
 import scala.collection.mutable
 import scala.collection.mutable.ListBuffer
 
-class Data2MongoSink extends SinkProcessor  {
+class Data2MongoSink extends SinkProcessor {
   private lazy val logger = Logger.getLogger(this.getClass)
-  override def process(protocolType: UmsProtocolType,
-                       sourceNamespace: String,
+
+  override def process(sourceNamespace: String,
                        sinkNamespace: String,
                        sinkProcessConfig: SinkProcessConfig,
                        schemaMap: collection.Map[String, (Int, UmsFieldType, Boolean)],
@@ -57,6 +56,8 @@ class Data2MongoSink extends SinkProcessor  {
     val db: String = namespace.database
     val table: String = namespace.table
     val mongoClient: MongoClient = getMongoClient(db, connectionConfig)
+    var allCount = 0l
+    var errorFlag = false
     try {
       val database: MongoDatabase = mongoClient.getDatabase(db)
       val collection: MongoCollection[Document] = database.getCollection(table)
@@ -68,6 +69,7 @@ class Data2MongoSink extends SinkProcessor  {
       if (sinkSpecificConfig.`mutation_type.get` == SourceMutationType.I_U_D.toString) {
         tupleList.foreach(payload => {
           val builder = getDocument(schemaMap, payload)
+          var count: Long = 0
           try {
             val keyFilter = {
               //              val f = sinkSpecificConfig._id.get.split(",").map(keyname => {
@@ -81,7 +83,7 @@ class Data2MongoSink extends SinkProcessor  {
             val umsidInTuple = payload(schemaMap(UmsSysField.ID.toString)._1).toLong
             val updateFilter = and(keyFilter, gte(UmsSysField.ID.toString, umsidInTuple))
 
-            val count: Long = collection.count(updateFilter).headResult()
+            count = collection.count(updateFilter).headResult()
             if (count == 0) {
               val op: FindOneAndReplaceOptions = FindOneAndReplaceOptions().upsert(true)
               collection.findOneAndReplace(keyFilter, builder.result(), op).results()
@@ -89,6 +91,8 @@ class Data2MongoSink extends SinkProcessor  {
           } catch {
             case e: Throwable =>
               logger.error("findOneAndReplace error,document:" + builder, e)
+              allCount = allCount + count
+              errorFlag = true
           }
         })
       } else {
@@ -118,18 +122,22 @@ class Data2MongoSink extends SinkProcessor  {
                 } catch {
                   case e: Throwable =>
                     logger.error("insert error,document:" + doc, e)
+                    allCount += 1
+                    errorFlag = true
                 }
               })
           }
         }
       }
-
-    }
-
-    catch {
-      case e: Throwable => logger.error("", e)
+    } catch {
+      case e: Throwable =>
+        logger.error("", e)
+        allCount += tupleList.size
+        errorFlag = true
     }
     finally mongoClient.close()
+
+    if(errorFlag)throw new Exception("du mongodb sink has error,count="+allCount)
 
   }
 

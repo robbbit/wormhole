@@ -25,25 +25,22 @@ import com.alibaba.fastjson.JSON
 import edp.rider.RiderStarter.modules._
 import edp.rider.common.Action._
 import edp.rider.common.StreamStatus._
-import edp.rider.common._
-import edp.rider.kafka.KafkaUtils
+import edp.rider.common.StreamType._
+import edp.rider.common.{StreamType, _}
 import edp.rider.rest.persistence.entities._
 import edp.rider.rest.util.CommonUtils._
 import edp.rider.rest.util.UdfUtils.sendUdfDirective
-import edp.rider.yarn.{SubmitYarnJob, YarnClientLog}
-import edp.rider.yarn.YarnStatusQuery.{getAllYarnAppStatus, getAppStatusByRest}
-import edp.rider.yarn.SubmitYarnJob.{generateSparkStreamStartSh, runShellCommand}
 import edp.rider.wormhole.{BatchFlowConfig, KafkaInputBaseConfig, KafkaOutputConfig, SparkConfig}
+import edp.rider.yarn.SubmitYarnJob._
+import edp.rider.yarn.YarnStatusQuery.{getActiveResourceManager, getAllYarnAppStatus, getAppStatusByRest}
+import edp.rider.yarn.{SubmitYarnJob, YarnClientLog}
 import edp.rider.zookeeper.PushDirective
 import edp.rider.zookeeper.PushDirective._
-import edp.wormhole.kafka.WormholeTopicCommand
+import edp.wormhole.kafka.WormholeGetOffsetUtils._
 import edp.wormhole.ums.UmsProtocolType._
 import edp.wormhole.ums.UmsSchemaUtils.toUms
-import slick.jdbc.MySQLProfile.api._
-import edp.rider.common.StreamType
-import edp.rider.common.StreamType._
-import edp.wormhole.util.DateUtils
 import edp.wormhole.util.JsonUtils._
+import slick.jdbc.MySQLProfile.api._
 
 import scala.collection.mutable
 import scala.collection.mutable.{ArrayBuffer, ListBuffer}
@@ -83,115 +80,124 @@ object StreamUtils extends RiderLogger {
     }
   }
 
-  def getStatus(action: String, streams: Seq[Stream]): Seq[Stream] = {
-    val fromTime =
-      if (streams.nonEmpty && streams.exists(_.startedTime.getOrElse("") != ""))
-        streams.filter(_.startedTime.getOrElse("") != "").map(_.startedTime).min.getOrElse("")
-      else ""
-    //    riderLogger.info(s"fromTime: $fromTime")
-    val appInfoList: List[AppResult] =
-      if (fromTime == "") List() else getAllYarnAppStatus(fromTime).sortWith(_.appId < _.appId)
-    //    riderLogger.info(s"app info size: ${appInfoList.size}")
+  def getAppInfo(fromTime: String, streamName: String): Option[AppResult] = {
+    val appInfoMap: Map[String, AppResult] = if (fromTime == "") Map.empty[String, AppResult] else getAllYarnAppStatus(fromTime, Seq(streamName))
+    if (appInfoMap.contains(streamName)) Some(appInfoMap(streamName))
+    else None
+  }
+
+  def getYarnUri(status: String, appId: String): String = {
+    val rmUrl = getActiveResourceManager(RiderConfig.spark.rm1Url, RiderConfig.spark.rm2Url)
+    if (status.toLowerCase == "running")
+      s"http://${rmUrl.stripPrefix("http://").stripSuffix("/")}/proxy/$appId/"
+    else
+      s"http://${rmUrl.stripPrefix("http://").stripSuffix("/")}/cluster/app/$appId/"
+  }
+
+  def getStreamYarnAppStatus(streams: Seq[Stream], appInfoMap: Map[String, AppResult]) = {
     streams.map(
       stream => {
         val dbStatus = stream.status
-        val dbUpdateTime = stream.updateTime
+        val startedTime = if (stream.startedTime.getOrElse("") == "") null else stream.startedTime.get
+        val stoppedTime = if (stream.stoppedTime.getOrElse("") == "") null else stream.stoppedTime.get
+        val appInfo = {
+          val endAction =
+            if (dbStatus == STARTING.toString) "refresh_log"
+            else "refresh_spark"
+          val sparkStatus: AppInfo = endAction match {
+            case "refresh_spark" =>
+              getAppStatusByRest(appInfoMap, stream.sparkAppid.getOrElse(""), stream.name, stream.status, startedTime, stoppedTime)
+            case "refresh_log" =>
+              val logInfo = YarnClientLog.getAppStatusByLog(stream.name, dbStatus, stream.logPath.getOrElse(""))
+              logInfo._2 match {
+                case "running" =>
+                  getAppStatusByRest(appInfoMap, logInfo._1, stream.name, logInfo._2, startedTime, stoppedTime)
+                case "waiting" =>
+                  val curInfo = getAppStatusByRest(appInfoMap, logInfo._1, stream.name, logInfo._2, startedTime, stoppedTime)
+                  AppInfo(curInfo.appId, curInfo.appState, startedTime, curInfo.finishedTime)
+                case "starting" => getAppStatusByRest(appInfoMap, logInfo._1, stream.name, logInfo._2, startedTime, stoppedTime)
+                case "failed" => AppInfo(logInfo._1, "failed", startedTime, currentSec)
+              }
+            case _ => AppInfo("", stream.status, startedTime, null)
+          }
+          if (sparkStatus == null) AppInfo(stream.sparkAppid.getOrElse(""), "failed", startedTime, stoppedTime)
+          else {
+            val resStatus = dbStatus match {
+              case "starting" =>
+                sparkStatus.appState.toUpperCase match {
+                  case "RUNNING" => AppInfo(sparkStatus.appId, "running", sparkStatus.startedTime, sparkStatus.finishedTime)
+                  case "ACCEPTED" => AppInfo(sparkStatus.appId, "waiting", sparkStatus.startedTime, sparkStatus.finishedTime)
+                  case "KILLED" | "FINISHED" | "FAILED" => AppInfo(sparkStatus.appId, "failed", sparkStatus.startedTime, sparkStatus.finishedTime)
+                  case _ => AppInfo("", "starting", startedTime, stoppedTime)
+                }
+              case "waiting" => sparkStatus.appState.toUpperCase match {
+                case "RUNNING" => AppInfo(sparkStatus.appId, "running", sparkStatus.startedTime, sparkStatus.finishedTime)
+                case "ACCEPTED" => AppInfo(sparkStatus.appId, "waiting", sparkStatus.startedTime, sparkStatus.finishedTime)
+                case "KILLED" | "FINISHED" | "FAILED" => AppInfo(sparkStatus.appId, "failed", sparkStatus.startedTime, sparkStatus.finishedTime)
+                case _ => AppInfo(sparkStatus.appId, "waiting", startedTime, stoppedTime)
+              }
+              case "running" =>
+                if (List("FAILED", "KILLED", "FINISHED").contains(sparkStatus.appState.toUpperCase)) {
+                  FlowUtils.updateStatusByStreamStop(stream.id, stream.streamType, "failed")
+                  AppInfo(sparkStatus.appId, "failed", sparkStatus.startedTime, sparkStatus.finishedTime)
+                } else {
+                  AppInfo(sparkStatus.appId, "running", startedTime, stoppedTime)
+                }
+              case "stopping" =>
+                if (sparkStatus.appState == "KILLED" || sparkStatus.appState == "FAILED" || sparkStatus.appState == "FINISHED") {
+                  FlowUtils.updateStatusByStreamStop(stream.id, stream.streamType, "stopped")
+                  AppInfo(sparkStatus.appId, "stopped", sparkStatus.startedTime, sparkStatus.finishedTime)
+                }
+                else {
+                  AppInfo(sparkStatus.appId, "stopping", startedTime, stoppedTime)
+                }
+              case "new" =>
+                AppInfo("", "new", startedTime, stoppedTime)
+              case "stopped" =>
+                sparkStatus.appState.toUpperCase match {
+                  case "RUNNING" => AppInfo(sparkStatus.appId, "running", sparkStatus.startedTime, sparkStatus.finishedTime)
+                  case "ACCEPTED" => AppInfo(sparkStatus.appId, "waiting", sparkStatus.startedTime, sparkStatus.finishedTime)
+                  case "KILLED" | "FINISHED" | "FAILED" => AppInfo(sparkStatus.appId, "stopped", sparkStatus.startedTime, sparkStatus.finishedTime)
+                  case _ => AppInfo(sparkStatus.appId, "stopped", startedTime, stoppedTime)
+                }
+              case "failed" =>
+                sparkStatus.appState.toUpperCase match {
+                  case "RUNNING" => AppInfo(sparkStatus.appId, "running", sparkStatus.startedTime, sparkStatus.finishedTime)
+                  case "ACCEPTED" => AppInfo(sparkStatus.appId, "waiting", sparkStatus.startedTime, sparkStatus.finishedTime)
+                  case "KILLED" | "FINISHED" | "FAILED" | _ => AppInfo(sparkStatus.appId, "failed", sparkStatus.startedTime, sparkStatus.finishedTime)
+
+                }
+              case _ => AppInfo(sparkStatus.appId, dbStatus, startedTime, stoppedTime)
+            }
+            resStatus
+          }
+        }
+        stream.updateFromSpark(appInfo)
+      })
+  }
+
+
+  def getStatus(action: String, streams: Seq[Stream]): Seq[Stream] = {
+    streams.map(
+      stream => {
         val startedTime = if (stream.startedTime.getOrElse("") == "") null else stream.startedTime.get
         val stoppedTime = if (stream.stoppedTime.getOrElse("") == "") null else stream.stoppedTime.get
         val appInfo = {
           if (action == "start") AppInfo("", "starting", currentSec, null)
           else if (action == "stop") AppInfo("", "stopping", startedTime, stoppedTime)
-          else {
-            val endAction =
-              if (dbStatus == STARTING.toString) "refresh_log"
-              else "refresh_spark"
-
-            val sparkStatus: AppInfo = endAction match {
-              case "refresh_spark" =>
-                getAppStatusByRest(appInfoList, stream.sparkAppid.getOrElse(""), stream.name, stream.status, startedTime, stoppedTime)
-              case "refresh_log" =>
-                val logInfo = YarnClientLog.getAppStatusByLog(stream.name, dbStatus, stream.logPath.getOrElse(""))
-                logInfo._2 match {
-                  case "running" =>
-                    getAppStatusByRest(appInfoList, logInfo._1, stream.name, logInfo._2, startedTime, stoppedTime)
-                  case "waiting" =>
-                    val curInfo = getAppStatusByRest(appInfoList, logInfo._1, stream.name, logInfo._2, startedTime, stoppedTime)
-                    AppInfo(curInfo.appId, curInfo.appState, startedTime, curInfo.finishedTime)
-                  case "starting" => getAppStatusByRest(appInfoList, logInfo._1, stream.name, logInfo._2, startedTime, stoppedTime)
-                  case "failed" => AppInfo(logInfo._1, "failed", startedTime, currentSec)
-                }
-              case _ => AppInfo("", stream.status, startedTime, null)
-            }
-            if (sparkStatus == null) AppInfo(stream.sparkAppid.getOrElse(""), "failed", startedTime, stoppedTime)
-            else {
-              val resStatus = dbStatus match {
-                case "starting" =>
-                  sparkStatus.appState.toUpperCase match {
-                    case "RUNNING" => AppInfo(sparkStatus.appId, "running", sparkStatus.startedTime, sparkStatus.finishedTime)
-                    case "ACCEPTED" => AppInfo(sparkStatus.appId, "waiting", sparkStatus.startedTime, sparkStatus.finishedTime)
-                    case "KILLED" | "FINISHED" | "FAILED" => AppInfo(sparkStatus.appId, "failed", sparkStatus.startedTime, sparkStatus.finishedTime)
-                    case _ => AppInfo("", "starting", startedTime, stoppedTime)
-                  }
-                case "waiting" => sparkStatus.appState.toUpperCase match {
-                  case "RUNNING" => AppInfo(sparkStatus.appId, "running", sparkStatus.startedTime, sparkStatus.finishedTime)
-                  case "ACCEPTED" => AppInfo(sparkStatus.appId, "waiting", sparkStatus.startedTime, sparkStatus.finishedTime)
-                  case "KILLED" | "FINISHED" | "FAILED" => AppInfo(sparkStatus.appId, "failed", sparkStatus.startedTime, sparkStatus.finishedTime)
-                  case _ => AppInfo(sparkStatus.appId, "waiting", startedTime, stoppedTime)
-                }
-                case "running" =>
-                  if (List("FAILED", "KILLED", "FINISHED").contains(sparkStatus.appState.toUpperCase)) {
-                    FlowUtils.updateStatusByStreamStop(stream.id, stream.streamType, "failed")
-                    AppInfo(sparkStatus.appId, "failed", sparkStatus.startedTime, sparkStatus.finishedTime)
-                  }
-                  else {
-                    AppInfo(sparkStatus.appId, "running", startedTime, stoppedTime)
-                  }
-                case "stopping" =>
-                  if (sparkStatus.appState == "KILLED" || sparkStatus.appState == "FAILED" || sparkStatus.appState == "FINISHED") {
-                    FlowUtils.updateStatusByStreamStop(stream.id, stream.streamType, "stopped")
-                    AppInfo(sparkStatus.appId, "stopped", sparkStatus.startedTime, sparkStatus.finishedTime)
-                  }
-                  else {
-                    AppInfo(sparkStatus.appId, "stopping", startedTime, stoppedTime)
-                  }
-                case "new" =>
-                  AppInfo("", "new", startedTime, stoppedTime)
-                case "stopped" =>
-                  AppInfo(sparkStatus.appId, "stopped", startedTime, stoppedTime)
-                case "failed" =>
-                  sparkStatus.appState.toUpperCase match {
-                    case "RUNNING" => AppInfo(sparkStatus.appId, "running", sparkStatus.startedTime, sparkStatus.finishedTime)
-                    case "ACCEPTED" => AppInfo(sparkStatus.appId, "waiting", sparkStatus.startedTime, sparkStatus.finishedTime)
-                    case "KILLED" | "FINISHED" | "FAILED" | _ => AppInfo(sparkStatus.appId, "failed", sparkStatus.startedTime, sparkStatus.finishedTime)
-
-                  }
-                case _ => AppInfo(sparkStatus.appId, dbStatus, startedTime, stoppedTime)
-              }
-              resStatus
-            }
-          }
+          else AppInfo(stream.sparkAppid.getOrElse(""), stream.status, startedTime, stoppedTime)
         }
-        //        val preAppInfo = AppInfo(stream.sparkAppid.getOrElse(""), dbStatus, startedTime, stoppedTime)
-        //        if (!preAppInfo.equals(appInfo))
         stream.updateFromSpark(appInfo)
-        //        else stream
       })
   }
 
 
-  def genStreamNameByProjectName(projectName: String, name: String): String = s"wormhole_${projectName}_$name"
-
-  //  def getStreamConfig(stream: Stream) = {
-  //    val kafkaUrl = getKafkaByStreamId(stream.id)
-  //    val launchConfig = json2caseClass[LaunchConfig](stream.launchConfig)
-  //    val config = BatchFlowConfig(KafkaInputBaseConfig(stream.name, launchConfig.durations.toInt, kafkaUrl, launchConfig.maxRecords.toInt * 1024 * 1024, RiderConfig.spark.kafkaSessionTimeOut, RiderConfig.spark.kafkaGroupMaxSessionTimeOut),
-  //      KafkaOutputConfig(RiderConfig.consumer.feedbackTopic, RiderConfig.consumer.brokers),
-  //      SparkConfig(stream.id, stream.name, "yarn-cluster", launchConfig.partitions.toInt),
-  //      launchConfig.partitions.toInt, RiderConfig.zk, false, Some(RiderConfig.spark.hdfs_root))
-  //    caseClass2json[BatchFlowConfig](config)
-  //  }
+  def genStreamNameByProjectName(projectName: String, name: String): String =
+    if (RiderConfig.riderServer.clusterId != "") s"wormhole_${RiderConfig.riderServer.clusterId}_${projectName}_$name"
+    else s"wormhole_${projectName}_$name"
 
   def getStreamConfig(stream: Stream) = {
+    val startConfig = json2caseClass[StartConfig](stream.startConfig)
     val launchConfig = json2caseClass[LaunchConfig](stream.launchConfig)
     val kafkaUrl = getKafkaByStreamId(stream.id)
     val config =
@@ -199,14 +205,14 @@ object StreamUtils extends RiderLogger {
         case Some(_) =>
           BatchFlowConfig(KafkaInputBaseConfig(stream.name, launchConfig.durations.toInt, kafkaUrl, launchConfig.maxRecords.toInt * 1024 * 1024, RiderConfig.spark.kafkaSessionTimeOut, RiderConfig.spark.kafkaGroupMaxSessionTimeOut),
             KafkaOutputConfig(RiderConfig.consumer.feedbackTopic, RiderConfig.consumer.brokers),
-            SparkConfig(stream.id, stream.name, "yarn-cluster", launchConfig.partitions.toInt),
-            launchConfig.partitions.toInt, RiderConfig.zk, false,
-            RiderConfig.spark.remoteHdfsRoot, RiderConfig.spark.remoteHdfsNamenodeHosts, RiderConfig.spark.remoteHdfsNamenodeIds)
+            SparkConfig(stream.id, stream.name, "yarn-cluster", startConfig.executorNums * startConfig.perExecutorCores),
+            launchConfig.partitions.toInt, RiderConfig.zk.address, RiderConfig.zk.path, false,
+            RiderConfig.spark.remoteHdfsRoot, RiderConfig.kerberos.enabled, RiderConfig.spark.remoteHdfsNamenodeHosts, RiderConfig.spark.remoteHdfsNamenodeIds)
         case None =>
           BatchFlowConfig(KafkaInputBaseConfig(stream.name, launchConfig.durations.toInt, kafkaUrl, launchConfig.maxRecords.toInt * 1024 * 1024, RiderConfig.spark.kafkaSessionTimeOut, RiderConfig.spark.kafkaGroupMaxSessionTimeOut),
             KafkaOutputConfig(RiderConfig.consumer.feedbackTopic, RiderConfig.consumer.brokers),
             SparkConfig(stream.id, stream.name, "yarn-cluster", launchConfig.partitions.toInt),
-            launchConfig.partitions.toInt, RiderConfig.zk, false, Some(RiderConfig.spark.hdfsRoot))
+            launchConfig.partitions.toInt, RiderConfig.zk.address, RiderConfig.zk.path, false, Some(RiderConfig.spark.hdfsRoot), RiderConfig.kerberos.enabled)
       }
     caseClass2json[BatchFlowConfig](config)
   }
@@ -217,7 +223,9 @@ object StreamUtils extends RiderLogger {
       case StreamType.SPARK =>
         val args = getStreamConfig(stream)
         val startConfig = json2caseClass[StartConfig](stream.startConfig)
-        val commandSh = generateSparkStreamStartSh(s"'''$args'''", stream.name, logPath, startConfig, stream.streamConfig.getOrElse(""), stream.functionType)
+        //val jvmConfig = Array(stream.JVMDriverConfig.getOrElse("")) :+ stream.JVMExecutorConfig.getOrElse("")
+        // runShellCommand(s"kinit -kt ${RiderConfig.kerberos.keyTab} ${RiderConfig.kerberos.principal}")
+        val commandSh = generateSparkStreamStartSh(s"'''$args'''", stream.name, logPath, startConfig, stream.JVMDriverConfig.getOrElse(""), stream.JVMExecutorConfig.getOrElse(""), stream.othersConfig.getOrElse(""), stream.functionType)
         riderLogger.info(s"start stream ${stream.id} command: $commandSh")
         runShellCommand(commandSh)
       case StreamType.FLINK =>
@@ -265,7 +273,9 @@ object StreamUtils extends RiderLogger {
         // insert or update user defined topics by start
         streamUdfTopicDal.insertUpdateByStartOrRenew(streamId, userdefinedTopics, userId)
         // send topics start directive
-        sendTopicDirective(streamId, autoRegisteredTopics ++: userdefinedTopics, userId, true)
+        val topics = autoRegisteredTopics ++: userdefinedTopics
+        val addHeartbeatTopic = if (topics.isEmpty) true else false
+        sendTopicDirective(streamId, autoRegisteredTopics, Some(userdefinedTopics), userId, addHeartbeatTopic)
       case None =>
         // delete all user defined topics by stream id
         Await.result(streamUdfTopicDal.deleteByFilter(_.streamId === streamId), minTimeOut)
@@ -286,7 +296,7 @@ object StreamUtils extends RiderLogger {
         // insert or update user defined topics by start
         streamUdfTopicDal.insertUpdateByStartOrRenew(streamId, userdefinedTopics, userId)
         // send topics renew directive which action is 1
-        sendTopicDirective(streamId, (autoRegisteredTopics ++: userdefinedTopics).filter(_.action.getOrElse(0) == 1), userId, false)
+        sendTopicDirective(streamId, autoRegisteredTopics.filter(_.action.getOrElse(0) == 1), Some(userdefinedTopics.filter(_.action.getOrElse(0) == 1)), userId, false)
       case None =>
         val deleteTopics = streamUdfTopicDal.deleteByStartOrRenew(streamId, Seq())
         // delete topics directive in zookeeper
@@ -294,22 +304,27 @@ object StreamUtils extends RiderLogger {
     }
   }
 
-  def sendTopicDirective(streamId: Long, topicSeq: Seq[PutTopicDirective], userId: Long, addDefaultTopic: Boolean = true) = {
+  def sendTopicDirective(streamId: Long, incrementTopicSeq: Seq[PutTopicDirective], initialTopicSeq: Option[Seq[PutTopicDirective]], userId: Long, addDefaultTopic: Boolean = true) = {
     try {
       val directiveSeq = new ArrayBuffer[Directive]
-      val zkConURL: String = RiderConfig.zk
-      topicSeq.filter(_.rate == 0).map(
+      val zkConURL: String = RiderConfig.zk.address
+      (incrementTopicSeq ++: initialTopicSeq.getOrElse(mutable.ArraySeq.empty[PutTopicDirective])).filter(_.rate == 0).map(
         topic => sendUnsubscribeTopicDirective(streamId, topic.name, userId)
       )
-      topicSeq.filter(_.rate != 0).foreach({
+      if (initialTopicSeq.nonEmpty) initialTopicSeq.get.filter(_.rate != 0).foreach({
         topic =>
-          val tuple = Seq(streamId, currentMicroSec, topic.name, topic.rate, topic.partitionOffsets).mkString("#")
+          val tuple = Seq(streamId, currentMicroSec, topic.name, topic.rate, topic.partitionOffsets, "initial").mkString("#")
+          directiveSeq += Directive(0, DIRECTIVE_TOPIC_SUBSCRIBE.toString, streamId, 0, tuple, zkConURL, currentSec, userId)
+      })
+      incrementTopicSeq.filter(_.rate != 0).foreach({
+        topic =>
+          val tuple = Seq(streamId, currentMicroSec, topic.name, topic.rate, topic.partitionOffsets, "increment").mkString("#")
           directiveSeq += Directive(0, DIRECTIVE_TOPIC_SUBSCRIBE.toString, streamId, 0, tuple, zkConURL, currentSec, userId)
       })
       if (addDefaultTopic) {
         val broker = getKafkaByStreamId(streamId)
-        val blankTopicOffset = KafkaUtils.getKafkaLatestOffset(broker, RiderConfig.spark.wormholeHeartBeatTopic)
-        val blankTopic = Directive(0, DIRECTIVE_TOPIC_SUBSCRIBE.toString, streamId, 0, Seq(streamId, currentMicroSec, RiderConfig.spark.wormholeHeartBeatTopic, RiderConfig.spark.topicDefaultRate, blankTopicOffset).mkString("#"), zkConURL, currentSec, userId)
+        val blankTopicOffset = getLatestOffset(broker, RiderConfig.spark.wormholeHeartBeatTopic, RiderConfig.kerberos.enabled)
+        val blankTopic = Directive(0, DIRECTIVE_TOPIC_SUBSCRIBE.toString, streamId, 0, Seq(streamId, currentMicroSec, RiderConfig.spark.wormholeHeartBeatTopic, RiderConfig.spark.topicDefaultRate, blankTopicOffset, "initial").mkString("#"), zkConURL, currentSec, userId)
         directiveSeq += blankTopic
       }
 
@@ -353,6 +368,11 @@ object StreamUtils extends RiderLogger {
                |"nullable": false
                |},
                |{
+               |"name": "topic_type",
+               |"type": "string",
+               |"nullable": false
+               |},
+               |{
                |"name": "partitions_offset",
                |"type": "string",
                |"nullable": false
@@ -361,15 +381,19 @@ object StreamUtils extends RiderLogger {
                |},
                |"payload": [
                |{
-               |"tuple": [${directive.id}, ${topicInfo(0)}, "${topicInfo(1)}", "${topicInfo(2)}", ${topicInfo(3)}, "${topicInfo(4)}"]
+               |"tuple": [${directive.id}, ${topicInfo(0)}, "${topicInfo(1)}", "${topicInfo(2)}", ${topicInfo(3)}, "${topicInfo(5)}","${topicInfo(4)}"]
                |}
                |]
                |}
           """.stripMargin.replaceAll("[\\n\\t\\r]+", "")
           jsonCompact(ums)
       }).mkString("\n")
-      PushDirective.sendTopicDirective(streamId, topicUms)
-      riderLogger.info(s"user $userId send topic directive $topicUms success.")
+      if (topicUms.nonEmpty) {
+        PushDirective.sendTopicDirective(streamId, topicUms)
+        riderLogger.info(s"user $userId send topic directive $topicUms success.")
+      } else {
+        riderLogger.info(s"topic offsets don't need update.")
+      }
     } catch {
       case ex: Exception =>
         riderLogger.error(s"send stream $streamId topic directive failed", ex)
@@ -383,7 +407,7 @@ object StreamUtils extends RiderLogger {
 
   def sendUnsubscribeTopicDirective(streamId: Long, topicName: String, userId: Long): Unit = {
     try {
-      val zkConURL: String = RiderConfig.zk
+      val zkConURL: String = RiderConfig.zk.address
       val directive = Await.result(directiveDal.insert(Directive(0, DIRECTIVE_TOPIC_SUBSCRIBE.toString, streamId, 0, "", zkConURL, currentSec, userId)
       ), minTimeOut)
       val topicUms =
@@ -470,16 +494,26 @@ object StreamUtils extends RiderLogger {
     } else 10
   }
 
-  def checkConfigFormat(startConfig: String, launchConfig: String, streamConfig: String) = {
-    (isJson(startConfig), isJson(launchConfig), isStreamConfig(streamConfig)) match {
-      case (true, true, true) => (true, "success")
-      case (true, true, false) => (false, s"streamConfig $streamConfig doesn't meet key=value,key1=value1 format")
-      case (true, false, true) => (false, s"launchConfig $launchConfig is not json type")
-      case (true, false, false) => (false, s"launchConfig $launchConfig is not json type, streamConfig $streamConfig doesn't meet key=value,key1=value1 format")
-      case (false, true, true) => (false, s"startConfig $startConfig is not json type")
-      case (false, true, false) => (false, s"startConfig $startConfig is not json type, streamConfig $streamConfig doesn't meet key=value,key1=value1 format")
-      case (false, false, true) => (false, s"startConfig $startConfig is not json type, launchConfig $launchConfig is not json type")
-      case (false, false, false) => (false, s"startConfig $startConfig is not json type, launchConfig $launchConfig is not json type, streamConfig $streamConfig doesn't meet key=value,key1=value1 format")
+  def checkConfigFormat(startConfig: String, launchConfig: String, JVMDriverConfig: String, JVMExecutorConfig: String, othersConfig: String) = {
+    val jvmConfig = JVMDriverConfig + JVMExecutorConfig
+    (isJson(startConfig), isJson(launchConfig), isStreamConfig(jvmConfig), isStreamConfig(othersConfig)) match {
+      case (true, true, true, true) => (true, "success")
+      case (true, true, true, false) => (false, s"othersConfig $othersConfig doesn't meet key=value,key1=value1 format")
+      case (true, true, false, true) => (false, s"jvmConfig $jvmConfig doesn't meet key=value,key1=value1 format")
+      case (true, true, false, false) => (false, s"jvmConfig $jvmConfig doesn't meet key=value,key1=value1 format, othersConfig $othersConfig doesn't meet key=value,key1=value1 format")
+      case (true, false, true, true) => (false, s"launchConfig $launchConfig is not json type")
+      case (true, false, true, false) => (false, s"launchConfig $launchConfig is not json type, othersConfig $othersConfig doesn't meet key=value,key1=value1 format")
+      case (true, false, false, true) => (false, s"launchConfig $launchConfig is not json type, jvmConfig $jvmConfig doesn't meet key=value,key1=value1 format")
+      case (true, false, false, false) => (false, s"launchConfig $launchConfig is not json type, jvmConfig $jvmConfig doesn't meet key=value,key1=value1 format, othersConfig $othersConfig doesn't meet key=value,key1=value1 format")
+      case (false, true, true, true) => (false, s"startConfig $startConfig is not json type")
+      case (false, true, true, false) => (false, s"startConfig $startConfig is not json type, othersConfig $othersConfig doesn't meet key=value,key1=value1 format")
+      case (false, true, false, true) => (false, s"startConfig $startConfig is not json type, jvmConfig $jvmConfig doesn't meet key=value,key1=value1 format")
+      case (false, true, false, false) => (false, s"startConfig $startConfig is not json type, jvmConfig $jvmConfig doesn't meet key=value,key1=value1 format, othersConfig $othersConfig doesn't meet key=value,key1=value1 format")
+      case (false, false, true, true) => (false, s"startConfig $startConfig is not json type, launchConfig $launchConfig is not json type")
+      case (false, false, true, false) => (false, s"startConfig $startConfig is not json type, launchConfig $launchConfig is not json type, othersConfig $othersConfig doesn't meet key=value,key1=value1 format")
+      case (false, false, false, true) => (false, s"startConfig $startConfig is not json type, launchConfig $launchConfig is not json type, jvmConfig $jvmConfig doesn't meet key=value,key1=value1 format")
+      case (false, false, false, false) => (false, s"startConfig $startConfig is not json type, launchConfig $launchConfig is not json type, jvmConfig $jvmConfig doesn't meet key=value,key1=value1 format, othersConfig $othersConfig doesn't meet key=value,key1=value1 format")
+
     }
   }
 
@@ -526,21 +560,26 @@ object StreamUtils extends RiderLogger {
     seq
   }
 
-  def stopStream(streamId: Long, streamType: String, sparkAppid: Option[String], status: String): String = {
-    if (status == RUNNING.toString || status == WAITING.toString) {
+  def stopStream(streamId: Long, streamType: String, sparkAppid: Option[String], status: String): (String, Boolean) = {
+    if (status == RUNNING.toString || status == WAITING.toString || status == STOPPING.toString) {
       if (sparkAppid.getOrElse("") != "") {
         val cmdStr = "yarn application -kill " + sparkAppid.get
         riderLogger.info(s"stop stream command: $cmdStr")
-        runShellCommand(cmdStr)
-        FlowUtils.updateStatusByStreamStop(streamId, streamType, STOPPING.toString)
-        STOPPING.toString
+        val stopSuccess = runYarnKillCommand(cmdStr)
+        if (stopSuccess) {
+          FlowUtils.updateStatusByStreamStop(streamId, streamType, STOPPING.toString)
+          (STOPPING.toString, true)
+        } else {
+          FlowUtils.updateStatusByStreamStop(streamId, streamType, status)
+          (status, false)
+        }
       } else {
         FlowUtils.updateStatusByStreamStop(streamId, streamType, STOPPED.toString)
-        STOPPED.toString
+        (STOPPED.toString, true)
       }
     } else {
       FlowUtils.updateStatusByStreamStop(streamId, streamType, STOPPED.toString)
-      STOPPED.toString
+      (STOPPED.toString, true)
     }
   }
 
@@ -576,13 +615,15 @@ object StreamUtils extends RiderLogger {
 
   def getLogPath(appName: String) = s"${RiderConfig.spark.clientLogRootPath}/$appName-${CommonUtils.currentNodSec}.log"
 
-  def getStreamTime(time: Option[String]) =
-    if (time.nonEmpty) time.get.split("\\.")(0) else null
+  def getStreamTime(time: Option[String]) = {
+    val timeValue = time.getOrElse("")
+    if (timeValue.nonEmpty) timeValue.split("\\.")(0) else null
+  }
 
-  def getDefaultJvmConf = {
+  def getDefaultJvmConf: RiderJVMConfig = {
     lazy val driverConf = RiderConfig.spark.driverExtraConf
     lazy val executorConf = RiderConfig.spark.executorExtraConf
-    driverConf + "," + executorConf
+    RiderJVMConfig(driverConf, executorConf)
   }
 
   def getDefaultSparkConf = {
@@ -627,22 +668,22 @@ object StreamUtils extends RiderLogger {
     else false
   }
 
-  def getConsumedOffset(streamId: Long, dbId: Long, topic: String): String = {
-    val stream = Await.result(streamDal.findById(streamId), minTimeOut).head
-    val feedbackOffsetOpt = Await.result(feedbackOffsetDal.getLatestOffset(streamId, topic), minTimeOut)
-    val startOffsetOpt = Await.result(streamInTopicDal.findByFilter(rel => rel.streamId === streamId && rel.nsDatabaseId === dbId), minTimeOut)
-
-    val offset =
-      if (startOffsetOpt.nonEmpty) {
-        if (feedbackOffsetOpt.nonEmpty) {
-          if (stream.startedTime.nonEmpty && stream.startedTime != null &&
-            DateUtils.yyyyMMddHHmmss(feedbackOffsetOpt.get.umsTs) > DateUtils.yyyyMMddHHmmss(stream.startedTime.get))
-            feedbackOffsetOpt.get.partitionOffsets
-          else startOffsetOpt.head.partitionOffsets
-        } else startOffsetOpt.head.partitionOffsets
-      } else throw new Exception("get consumed offset failed.")
-
-    formatOffset(offset)
-  }
+  //  def getConsumedOffset(streamId: Long, dbId: Long, topic: String): String = {
+  //    val stream = Await.result(streamDal.findById(streamId), minTimeOut).head
+  //    val feedbackOffsetOpt = Await.result(feedbackOffsetDal.getLatestOffset(streamId, topic), minTimeOut)
+  //    val startOffsetOpt = Await.result(streamInTopicDal.findByFilter(rel => rel.streamId === streamId && rel.nsDatabaseId === dbId), minTimeOut)
+  //
+  //    val offset =
+  //      if (startOffsetOpt.nonEmpty) {
+  //        if (feedbackOffsetOpt.nonEmpty) {
+  //          if (stream.startedTime.nonEmpty && stream.startedTime != null &&
+  //            DateUtils.yyyyMMddHHmmss(feedbackOffsetOpt.get.umsTs) > DateUtils.yyyyMMddHHmmss(stream.startedTime.get))
+  //            feedbackOffsetOpt.get.partitionOffsets
+  //          else startOffsetOpt.head.partitionOffsets
+  //        } else startOffsetOpt.head.partitionOffsets
+  //      } else throw new Exception("get consumed offset failed.")
+  //
+  //    formatOffset(offset)
+  //  }
 
 }

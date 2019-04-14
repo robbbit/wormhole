@@ -21,6 +21,7 @@
 
 package edp.rider.wormhole
 
+import edp.rider.rest.persistence.entities.FlowUdfResponse
 import edp.wormhole.util.config.{ConnectionConfig, KVConfig}
 
 
@@ -56,9 +57,11 @@ case class BatchFlowConfig(kafka_input: KafkaInputBaseConfig,
                            kafka_output: KafkaOutputConfig,
                            spark_config: SparkConfig,
                            rdd_partition_number: Int, //-1 do not repartition
+                           zookeeper_address: String,
                            zookeeper_path: String,
                            kafka_persistence_config_isvalid: Boolean,
                            stream_hdfs_address: Option[String],
+                           kerberos: Boolean=false,
                            hdfs_namenode_hosts: Option[String] = None,
                            hdfs_namenode_ids: Option[String] = None)
 
@@ -97,9 +100,19 @@ case class KafkaFlinkTopic(topic_name: String,
 
 case class KafkaInput(kafka_base_config: KafkaBaseConfig, kafka_topics: Seq[KafkaFlinkTopic])
 
-case class WhFlinkConfig(kafka_input: KafkaInput,
+case class WhFlinkConfig(flow_name: String,
+                         kafka_input: KafkaInput,
                          kafka_output: KafkaOutputConfig,
                          parallelism: Int,
                          zookeeper_address: String,
-                         flink_config: String = "")
+                         udf_config: Seq[FlowUdfResponse],
+                         feedback_enabled: Boolean,
+                         feedback_state_count: Int,
+                         feedback_interval:Int,
+                         flink_config: FlinkConfig ,
+                         kerberos: Boolean = false)
+
+case class FlinkConfig(checkpoint: FlinkCheckpoint)
+
+case class FlinkCheckpoint(enable: Boolean=false, `checkpointInterval.ms`: Int=60000, stateBackend:String)
 

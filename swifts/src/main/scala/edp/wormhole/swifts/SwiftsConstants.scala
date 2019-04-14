@@ -24,8 +24,5 @@ package edp.wormhole.swifts
 object SwiftsConstants {
 
   val REPLACE_STRING_INSQL = "swifts_join_fields_values"
-  val PROTOCOL_TYPE ="protocol_type"
 
-  val PROCESSING_TIME = "processing_time"
-  val EVENT_TIME = "event_time"
 }

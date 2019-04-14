@@ -25,15 +25,13 @@ import akka.http.scaladsl.model.StatusCodes._
 import akka.http.scaladsl.server.Route
 import edp.rider.RiderStarter.modules._
 import edp.rider.common._
-import edp.rider.kafka.KafkaUtils
-import edp.rider.kafka.KafkaUtils.{getKafkaEarliestOffset, getKafkaLatestOffset}
 import edp.rider.rest.persistence.dal.{FlowDal, FlowUdfDal, StreamDal}
 import edp.rider.rest.persistence.entities.{FlowTable, _}
 import edp.rider.rest.router.{JsonSerializer, ResponseJson, ResponseSeqJson, SessionClass}
 import edp.rider.rest.util.CommonUtils._
 import edp.rider.rest.util.ResponseUtils._
 import edp.rider.rest.util.{AuthorizationProvider, FlowUtils, StreamUtils}
-import edp.rider.service.util.CacheMap
+import edp.wormhole.kafka.WormholeGetOffsetUtils._
 import slick.jdbc.MySQLProfile.api._
 
 import scala.concurrent.Await
@@ -150,13 +148,13 @@ class FlowUserApi(flowDal: FlowDal, streamDal: StreamDal, flowUdfDal: FlowUdfDal
                     if (checkFormat._1) {
                       val flowInsertSeq =
                         if (Await.result(streamDal.findById(streamId), minTimeOut).head.functionType != "hdfslog")
-                          Seq(Flow(0, simple.projectId, simple.streamId, simple.sourceNs.trim, simple.sinkNs.trim, simple.parallelism, simple.consumedProtocol.trim, simple.sinkConfig,
-                            simple.tranConfig, "new", None, None, None, active = true, currentSec, session.userId, currentSec, session.userId))
+                          Seq(Flow(0, simple.flowName, simple.projectId, simple.streamId, simple.sourceNs.trim, simple.sinkNs.trim, simple.parallelism, simple.consumedProtocol.trim, simple.sinkConfig,
+                            simple.tranConfig, simple.tableKeys, simple.desc, "new", None, None, None, active = true, currentSec, session.userId, currentSec, session.userId))
                         else
                           FlowUtils.flowMatch(projectId, streamId, simple.sourceNs).map(
                             sourceNs =>
-                              Flow(0, simple.projectId, simple.streamId, sourceNs, sourceNs, simple.parallelism, simple.consumedProtocol, simple.sinkConfig,
-                                simple.tranConfig, "new", None, None, None, active = true, currentSec, session.userId, currentSec, session.userId)
+                              Flow(0, simple.flowName, simple.projectId, simple.streamId, sourceNs, sourceNs, simple.parallelism, simple.consumedProtocol, simple.sinkConfig,
+                                simple.tranConfig, simple.tableKeys, simple.desc, "new", None, None, None, active = true, currentSec, session.userId, currentSec, session.userId)
                           )
                       try {
                         val flows = flowDal.insertOrAbort(flowInsertSeq)
@@ -169,7 +167,7 @@ class FlowUserApi(flowDal: FlowDal, streamDal: StreamDal, flowUdfDal: FlowUdfDal
                                   val ns = namespaceDal.getNsDetail(flow.sourceNs)
                                   val latestOffset =
                                     try {
-                                      KafkaUtils.getKafkaLatestOffset(ns._1.connUrl, ns._2.nsDatabase)
+                                      getLatestOffset(ns._1.connUrl, ns._2.nsDatabase, RiderConfig.kerberos.enabled)
                                     } catch {
                                       case _: Exception =>
                                         ""
@@ -177,7 +175,6 @@ class FlowUserApi(flowDal: FlowDal, streamDal: StreamDal, flowUdfDal: FlowUdfDal
                                   FlowInTopic(0, flow.id, ns._3.nsDatabaseId, latestOffset, RiderConfig.flink.defaultRate, true, currentSec, session.userId, currentSec, session.userId)
                               }
                             Await.result(flowInTopicDal.insert(autoRegisteredTopics), minTimeOut)
-                            CacheMap.flowCacheMapRefresh
                             complete(OK, ResponseJson[Seq[FlowStream]](getHeader(200, session), flowStream))
                           case Failure(ex)
                           =>
@@ -224,12 +221,12 @@ class FlowUserApi(flowDal: FlowDal, streamDal: StreamDal, flowUdfDal: FlowUdfDal
                     if (checkFormat._1) {
                       val startedTime = if (flow.startedTime.getOrElse("") == "") null else flow.startedTime
                       val stoppedTime = if (flow.stoppedTime.getOrElse("") == "") null else flow.stoppedTime
-                      val updateFlow = Flow(flow.id, flow.projectId, flow.streamId, flow.sourceNs.trim, flow.sinkNs.trim, flow.parallelism, flow.consumedProtocol.trim, flow.sinkConfig,
-                        flow.tranConfig, flow.status, startedTime, stoppedTime, flow.logPath, flow.active, flow.createTime, flow.createBy, currentSec, session.userId)
+                      val updateFlow = Flow(flow.id, flow.flowName, flow.projectId, flow.streamId, flow.sourceNs.trim, flow.sinkNs.trim, flow.parallelism, flow.consumedProtocol.trim, flow.sinkConfig,
+                        flow.tranConfig, flow.tableKeys, flow.desc, flow.status, startedTime, stoppedTime, flow.logPath, flow.active, flow.createTime, flow.createBy, currentSec, session.userId)
 
                       //                      val stream = Await.result(streamDal.findById(streamId), minTimeOut).head
                       //                      val existFlow = Await.result(flowDal.findById(flow.id), minTimeOut).head
-
+                      flowHistoryDal.insert(flowDal.getFlowsByIds(Seq(flow.id)), "update", session.userId)
                       onComplete(flowDal.update(updateFlow).mapTo[Int]) {
                         case Success(_) =>
                           //                          if (streamId != flow.streamId)
@@ -351,8 +348,8 @@ class FlowUserApi(flowDal: FlowDal, streamDal: StreamDal, flowUdfDal: FlowUdfDal
     val newTopics = topics.userDefinedTopics.filter(!userDefinedTopicsName.contains(_))
     val newTopicsOffset = newTopics.map(topic => {
       val kafkaInfo = flowDal.getFlowKafkaInfo(flowId)
-      val latestOffset = getKafkaLatestOffset(kafkaInfo._2, topic)
-      val earliestOffset = getKafkaEarliestOffset(kafkaInfo._2, topic)
+      val latestOffset = getLatestOffset(kafkaInfo._2, topic, RiderConfig.kerberos.enabled)
+      val earliestOffset = getEarliestOffset(kafkaInfo._2, topic, RiderConfig.kerberos.enabled)
       val consumedOffset = earliestOffset
       SimpleFlowTopicAllOffsets(topic, RiderConfig.flink.defaultRate, consumedOffset, earliestOffset, latestOffset)
     })
@@ -411,8 +408,8 @@ class FlowUserApi(flowDal: FlowDal, streamDal: StreamDal, flowUdfDal: FlowUdfDal
     }
     val kafkaInfo = flowDal.getFlowKafkaInfo(flowId)
     // get kafka earliest/latest offset
-    val latestOffset = getKafkaLatestOffset(kafkaInfo._2, postTopic.name)
-    val earliestOffset = getKafkaEarliestOffset(kafkaInfo._2, postTopic.name)
+    val latestOffset = getLatestOffset(kafkaInfo._2, postTopic.name, RiderConfig.kerberos.enabled)
+    val earliestOffset = getEarliestOffset(kafkaInfo._2, postTopic.name, RiderConfig.kerberos.enabled)
 
     // response
     val topicResponse = SimpleFlowTopicAllOffsets(postTopic.name, RiderConfig.flink.defaultRate, earliestOffset, earliestOffset, latestOffset)

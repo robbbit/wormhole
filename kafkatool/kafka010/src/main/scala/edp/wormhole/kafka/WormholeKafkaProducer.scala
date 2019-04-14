@@ -25,12 +25,14 @@ import java.util.Properties
 
 import edp.wormhole.util.config.KVConfig
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.log4j.Logger
 
 import scala.collection.mutable
 
 object WormholeKafkaProducer extends Serializable {
 
   @volatile private var producerMap: mutable.HashMap[String, KafkaProducer[String, String]] = new mutable.HashMap[String, KafkaProducer[String, String]]
+  @transient lazy val logger = Logger.getLogger(this.getClass)
 
   private def getProducerProps: Properties = {
     val props = new Properties()
@@ -41,7 +43,7 @@ object WormholeKafkaProducer extends Serializable {
     props
   }
 
-  def init(brokers: String, kvConfig: Option[Seq[KVConfig]]): Unit = {
+  def init(brokers: String, kvConfig: Option[Seq[KVConfig]],kerberos:Boolean=false): Unit = {
 
     if (!producerMap.contains(brokers) || producerMap(brokers) == null) {
       synchronized {
@@ -53,6 +55,10 @@ object WormholeKafkaProducer extends Serializable {
             })
           }
 
+          if(kerberos){
+            props.put("security.protocol","SASL_PLAINTEXT")
+            props.put("sasl.kerberos.service.name","kafka")
+          }
           props.put("bootstrap.servers", brokers)
           producerMap(brokers) = new KafkaProducer[String, String](props)
         }
@@ -80,6 +86,9 @@ object WormholeKafkaProducer extends Serializable {
 
   private def send(topic: String, partition: Int, message: String, key: Option[String], brokers: String): Any = {
     try {
+      logger.info("==========================11111========================")
+      logger.info(s"topic:$topic,partition:$partition,message:$message,key:${key.get},brokers:$brokers")
+      logger.info("============================22222======================")
       sendInternal(topic, partition, message, key, brokers)
     } catch {
       case _: Throwable =>

@@ -7,7 +7,7 @@ import edp.wormhole.flinkx.common.{ConfMemoryStorage, WormholeFlinkxConfig}
 import edp.wormhole.flinkx.util.FlinkSchemaUtils.findJsonSchema
 import edp.wormhole.flinkx.util.UmsFlowStartUtils.extractVersion
 import edp.wormhole.flinkx.util.{FlinkSchemaUtils, UmsFlowStartUtils}
-import edp.wormhole.ums.{Ums, UmsFieldType, UmsProtocolType, UmsSchema}
+import edp.wormhole.ums._
 
 
 object WormholeFlinkxFlowDirective {
@@ -16,7 +16,6 @@ object WormholeFlinkxFlowDirective {
     val schemas = ums.schema.fields_get
     val sourceNamespace = ums.schema.namespace.toLowerCase
     val tuple = payloads.head
-
     val dataType: String = UmsFieldType.umsFieldValue(tuple.tuple, schemas, "data_type").toString.toLowerCase
     val consumptionDataStr = new String(new sun.misc.BASE64Decoder().decodeBuffer(UmsFieldType.umsFieldValue(tuple.tuple, schemas, "consumption_protocol").toString))
     val dataParseEncoded = UmsFieldType.umsFieldValue(tuple.tuple, schemas, "data_parse")

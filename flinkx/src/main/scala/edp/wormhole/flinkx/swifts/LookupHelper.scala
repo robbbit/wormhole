@@ -30,6 +30,7 @@ import edp.wormhole.util.CommonUtils
 import edp.wormhole.util.config.ConnectionConfig
 import edp.wormhole.util.swifts.SwiftsSql
 import org.apache.flink.api.common.typeinfo.TypeInformation
+import org.apache.flink.table.api.Types
 import org.apache.flink.types.Row
 import org.apache.log4j.Logger
 
@@ -45,9 +46,9 @@ object LookupHelper extends java.io.Serializable {
     swiftsSql.fields.get.split(",").map(field => {
       fieldIndex += 1
       val fields = field.split(":")
-      val fields1trim = fields(1).trim
-      val fieldTuple = if (fields1trim.toLowerCase.contains(" as ")) {
-        val asIndex = fields1trim.toLowerCase.indexOf(" as ")
+      val fields1trim = fields(1).trim.toLowerCase()
+      val fieldTuple = if (fields1trim.contains(" as ")) {
+        val asIndex = fields1trim.indexOf(" as ")
         val fieldType = fields1trim.substring(0, asIndex).trim
         val newName = fields1trim.substring(asIndex + 4).trim
         (fields(0).trim, (newName, fieldType, fieldIndex))
@@ -117,6 +118,7 @@ object LookupHelper extends java.io.Serializable {
     } catch {
       case ex: Throwable =>
         ex.printStackTrace()
+        throw ex
     } finally {
       if (null != conn)
         conn.close()
@@ -134,8 +136,8 @@ object LookupHelper extends java.io.Serializable {
     val sql = swiftsSql.sql
     val joinFieldsValueArray: Array[Any] = joinFieldsInRow(row, lookupTableFields, sourceTableFields, preSchemaMap)
     UmsDataSystem.dataSystem(dataSystem) match {
-      case UmsDataSystem.MYSQL | UmsDataSystem.ORACLE => getRmdbSql(joinFieldsValueArray, sql, lookupTableFields)
       case UmsDataSystem.CASSANDRA => getCassandraSql(joinFieldsValueArray, sql, lookupTableFields)
+      case _ => getRmdbSql(joinFieldsValueArray, sql, lookupTableFields)
     }
   }
 
@@ -144,8 +146,11 @@ object LookupHelper extends java.io.Serializable {
                       sourceTableFields: Array[String],
                       preSchemaMap: Map[String, (TypeInformation[_], Int)]): Array[Any] = {
     val fieldContent = sourceTableFields.map(fieldName => {
-      val value = FlinkSchemaUtils.object2TrueValue(preSchemaMap(fieldName.trim)._1, row.getField(preSchemaMap(fieldName.trim)._2))
-      if (value != null) value else "N/A"
+      var value = FlinkSchemaUtils.object2TrueValue(preSchemaMap(fieldName.trim)._1, row.getField(preSchemaMap(fieldName.trim)._2))
+      value =if (value != null) value else "N/A"
+      if (preSchemaMap(fieldName)._1 == Types.STRING || preSchemaMap(fieldName)._1 == Types.SQL_TIMESTAMP || preSchemaMap(fieldName)._1 == Types.SQL_DATE)
+        "'" + value + "'"
+      else value
     })
     if (!fieldContent.contains("N/A")) {
       fieldContent

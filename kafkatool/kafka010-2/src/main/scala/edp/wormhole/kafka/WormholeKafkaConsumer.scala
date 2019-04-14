@@ -1,3 +1,23 @@
+/*-
+ * <<
+ * wormhole
+ * ==
+ * Copyright (C) 2016 - 2017 EDP
+ * ==
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ * >>
+ */
+
 package edp.wormhole.kafka
 
 import java.util
@@ -12,7 +32,7 @@ import scala.collection.mutable.ListBuffer
 
 object WormholeKafkaConsumer {
 
-  def initConsumer(brokers: String, groupid: String, kvConfig: Option[Seq[KVConfig]]): KafkaConsumer[String, String] = {
+  def initConsumer(brokers: String, groupid: String, kvConfig: Option[Seq[KVConfig]],kerberos:Boolean=false): KafkaConsumer[String, String] = {
 
     val props = new Properties()
     props.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer")
@@ -25,6 +45,11 @@ object WormholeKafkaConsumer {
       kvConfig.get.foreach(kv => {
         props.put(kv.key, kv.value)
       })
+    }
+
+    if(kerberos){
+      props.put("security.protocol","SASL_PLAINTEXT")
+      props.put("sasl.kerberos.service.name","kafka")
     }
 
     new KafkaConsumer[String, String](props)
