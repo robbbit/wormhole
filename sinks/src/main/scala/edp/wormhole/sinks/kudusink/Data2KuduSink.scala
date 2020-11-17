@@ -21,16 +21,17 @@ class Data2KuduSink extends SinkProcessor {
                        schemaMap: collection.Map[String, (Int, UmsFieldType, Boolean)],
                        tupleList: Seq[Seq[String]],
                        connectionConfig: ConnectionConfig): Unit = {
+    logger.info(s"sink kudu size is ${tupleList.size}")
+    logger.info(s"sink kudu config is ${sinkProcessConfig}")
     KuduConnection.initKuduConfig(connectionConfig)
-    val namespace = UmsNamespace(sinkNamespace)
-    val tableName: String = namespace.table
-    val database = namespace.database
-
-    var allErrorsCount = 0
 
     val sinkSpecificConfig =
       if (sinkProcessConfig.specialConfig.isDefined) JsonUtils.json2caseClass[KuduConfig](sinkProcessConfig.specialConfig.get)
       else KuduConfig()
+    val namespace = UmsNamespace(sinkNamespace)
+    val tableName: String = namespace.table
+    val database = namespace.database + sinkSpecificConfig.`table_connect_character.get`
+    var allErrorsCount = 0
 
     val tableKeys: Seq[String] = sinkProcessConfig.tableKeyList
     tupleList.sliding(sinkSpecificConfig.`batch_size.get`, sinkSpecificConfig.`batch_size.get`).foreach(payload => {
@@ -63,7 +64,7 @@ class Data2KuduSink extends SinkProcessor {
           }
 
           if (insertList.nonEmpty) {
-            val errorsCount = KuduConnection.doInset(tableName, database, connectionConfig.connectionUrl, schemaMap, insertList)
+            val errorsCount = KuduConnection.doInsert(tableName, database, connectionConfig.connectionUrl, schemaMap, insertList)
             if (errorsCount > 0) {
               allErrorsCount = allErrorsCount + errorsCount
               logger.error("do sink error,count=" + errorsCount)
@@ -77,7 +78,7 @@ class Data2KuduSink extends SinkProcessor {
             }
           }
         } else if (tupleList.nonEmpty) {
-          val errorsCount = KuduConnection.doInset(tableName, database, connectionConfig.connectionUrl, schemaMap, tupleList)
+          val errorsCount = KuduConnection.doInsert(tableName, database, connectionConfig.connectionUrl, schemaMap, tupleList)
           if (errorsCount > 0) {
             allErrorsCount = allErrorsCount + errorsCount
             logger.error("do sink error,count=" + errorsCount)

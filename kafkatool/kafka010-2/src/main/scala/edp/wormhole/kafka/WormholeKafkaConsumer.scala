@@ -24,13 +24,16 @@ import java.util
 import java.util.Properties
 
 import edp.wormhole.util.config.KVConfig
-import org.apache.kafka.clients.consumer.{ConsumerRebalanceListener, ConsumerRecords, KafkaConsumer}
+import org.apache.kafka.clients.consumer.{ConsumerRebalanceListener, ConsumerRecord, ConsumerRecords, KafkaConsumer}
 import org.apache.kafka.common.TopicPartition
+import org.apache.log4j.Logger
 
+import scala.collection.JavaConversions
 import scala.collection.JavaConversions._
 import scala.collection.mutable.ListBuffer
 
 object WormholeKafkaConsumer {
+  private val logger = Logger.getLogger(this.getClass)
 
   def initConsumer(brokers: String, groupid: String, kvConfig: Option[Seq[KVConfig]],kerberos:Boolean=false): KafkaConsumer[String, String] = {
 
@@ -96,6 +99,26 @@ object WormholeKafkaConsumer {
 
     })
 
+  }
+
+  def consumeRecordsBetweenOffsetRange(consumer: KafkaConsumer[String, String], topicPartition: TopicPartition, fromOffset: Long,untilOffset: Long, readTimeout:Int) : ConsumerRecords[String, String]={
+    val consumeRecordList=new util.ArrayList[ConsumerRecord[String,String]]()
+    val consumeRecordMap=new util.HashMap[TopicPartition,util.List[ConsumerRecord[String,String]]]()
+    var currentOffset=fromOffset
+    consumer.assign(JavaConversions.seqAsJavaList(Seq(topicPartition)))
+    consumer.seek(topicPartition,fromOffset)
+    while(currentOffset<untilOffset){
+      val consumerRecordIterator=consumer.poll(readTimeout).iterator()
+
+      while(consumerRecordIterator.hasNext && currentOffset<untilOffset){
+        val consumeRecord=consumerRecordIterator.next()
+        currentOffset=consumeRecord.offset()
+        if(currentOffset<untilOffset)
+          consumeRecordList.add(consumeRecord)
+      }
+    }
+    consumeRecordMap.put(topicPartition,consumeRecordList)
+    return new ConsumerRecords[String, String](consumeRecordMap)
   }
 
   private def getAllTopicPartition(topicPartitionCount: Map[String, Int]): Seq[TopicPartition] = {
